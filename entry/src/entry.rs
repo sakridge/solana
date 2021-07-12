@@ -13,9 +13,13 @@ use serde::{Deserialize, Serialize};
 use solana_measure::measure::Measure;
 use solana_merkle_tree::MerkleTree;
 use solana_metrics::*;
-use solana_perf::cuda_runtime::PinnedVec;
-use solana_perf::perf_libs;
-use solana_perf::recycler::Recycler;
+use solana_perf::{
+    cuda_runtime::PinnedVec,
+    packet::{Packet, Packets, PacketsRecycler},
+    perf_libs,
+    recycler::Recycler,
+    sigverify,
+};
 use solana_rayon_threadlimit::get_thread_count;
 use solana_sdk::hash::Hash;
 use solana_sdk::packet::PACKET_DATA_SIZE;
@@ -260,10 +264,48 @@ pub struct EntryVerificationState {
     device_verification_data: DeviceVerificationData,
 }
 
+pub struct GpuSigVerificationData {
+    thread_h: Option<JoinHandle<(bool, u64)>>,
+}
+
+pub enum DeviceSigVerificationData {
+    Cpu(),
+    Gpu(GpuSigVerificationData),
+}
+
+pub struct EntrySigVerificationState<'a> {
+    verification_status: EntryVerificationStatus,
+    entries: Option<Vec<EntryType<'a>>>,
+    device_verification_data: DeviceSigVerificationData,
+    verify_duration_us: u64,
+}
+
+impl<'a> EntrySigVerificationState<'a> {
+    pub fn entries(&mut self) -> Option<Vec<EntryType<'a>>> {
+        self.entries.take()
+    }
+    pub fn finish_verify(&mut self) -> bool {
+        match &mut self.device_verification_data {
+            DeviceSigVerificationData::Gpu(verification_state) => {
+                let (verified, gpu_time_us) =
+                    verification_state.thread_h.take().unwrap().join().unwrap();
+                self.verify_duration_us += gpu_time_us;
+                verified
+            }
+            DeviceSigVerificationData::Cpu() => {
+                self.verification_status == EntryVerificationStatus::Success
+            }
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct VerifyRecyclers {
     hash_recycler: Recycler<PinnedVec<Hash>>,
     tick_count_recycler: Recycler<PinnedVec<u64>>,
+    packet_recycler: PacketsRecycler,
+    out_recycler: Recycler<PinnedVec<u8>>,
+    tx_offset_recycler: Recycler<sigverify::TxOffset>,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -364,6 +406,25 @@ pub trait EntrySlice {
         libsecp256k1_0_5_upgrade_enabled: bool,
         verify_tx_signatures_len: bool,
     ) -> Result<Vec<EntryType<'_>>>;
+    fn verify_and_hash_transactions_cpu(
+        &self,
+        skip_verification: bool,
+        secp256k1_program_enabled: bool,
+        verify_tx_signatures_len: bool,
+    ) -> EntrySigVerificationState<'_>;
+    fn start_verify_and_hash_transactions(
+        &self,
+        skip_verification: bool,
+        secp256k1_program_enabled: bool,
+        verify_tx_signatures_len: bool,
+        recyclers: VerifyRecyclers,
+    ) -> EntrySigVerificationState<'_>;
+    fn hash_and_verify_precompiles(
+        &self,
+        skip_verification: bool,
+        secp256k1_program_enabled: bool,
+        verify_tx_signatures_len: bool,
+    ) -> Option<Vec<EntryType<'_>>>;
 }
 
 impl EntrySlice for [Entry] {
@@ -514,6 +575,123 @@ impl EntrySlice for [Entry] {
         }
     }
 
+    fn start_verify_and_hash_transactions<'a>(
+        &'a self,
+        skip_verification: bool,
+        secp256k1_program_enabled: bool,
+        verify_tx_signatures_len: bool,
+        verify_recyclers: VerifyRecyclers,
+    ) -> EntrySigVerificationState<'a> {
+        let api = perf_libs::api();
+        if api.is_none() {
+            return self.verify_and_hash_transactions_cpu(
+                skip_verification,
+                secp256k1_program_enabled,
+                verify_tx_signatures_len,
+            );
+        }
+
+        let entries = self.hash_and_verify_precompiles(
+            skip_verification,
+            secp256k1_program_enabled,
+            verify_tx_signatures_len,
+        );
+        if entries.is_none() {
+            return EntrySigVerificationState {
+                verification_status: EntryVerificationStatus::Failure,
+                entries: None,
+                device_verification_data: DeviceSigVerificationData::Cpu(),
+                verify_duration_us: 0,
+            };
+        }
+        let entries = entries.unwrap();
+
+        let mut packets = Packets::new_with_recycler(
+            verify_recyclers.packet_recycler,
+            entries.len(),
+            "entry-sig-verify",
+        );
+        for (i, entry) in entries.iter().enumerate() {
+            match entry {
+                EntryType::Transactions(transactions) => {
+                    for hashed_tx in transactions {
+                        Packet::populate_packet(
+                            &mut packets.packets[i],
+                            None,
+                            hashed_tx.transaction(),
+                        )
+                        .unwrap();
+                    }
+                }
+                EntryType::Tick(_) => {}
+            }
+        }
+
+        let mut packets = vec![packets];
+        let tx_offset_recycler = verify_recyclers.tx_offset_recycler.clone();
+        let out_recycler = verify_recyclers.out_recycler.clone();
+        let gpu_verify_thread = thread::spawn(move || {
+            let mut verify_time = Measure::start("sigverify");
+            sigverify::ed25519_verify(&mut packets, &tx_offset_recycler, &out_recycler);
+            let verified = packets[0].packets.iter().all(|p| !p.meta.discard);
+            verify_time.stop();
+            (verified, verify_time.as_us())
+        });
+
+        EntrySigVerificationState {
+            verification_status: EntryVerificationStatus::Pending,
+            entries: Some(entries),
+            device_verification_data: DeviceSigVerificationData::Gpu(GpuSigVerificationData {
+                thread_h: Some(gpu_verify_thread),
+            }),
+            verify_duration_us: 0,
+        }
+    }
+
+    fn hash_and_verify_precompiles<'a>(
+        &'a self,
+        skip_verification: bool,
+        secp256k1_program_enabled: bool,
+        verify_tx_signatures_len: bool,
+    ) -> Option<Vec<EntryType<'a>>> {
+        let verify_and_hash = |tx: &'a Transaction| -> Option<HashedTransaction<'a>> {
+            let message_hash = if !skip_verification {
+                if secp256k1_program_enabled {
+                    // Verify tx precompiles if secp256k1 program is enabled.
+                    tx.verify_precompiles().ok()?;
+                }
+                if verify_tx_signatures_len && !tx.verify_signatures_len() {
+                    return None;
+                }
+                tx.message().hash()
+            } else {
+                tx.message().hash()
+            };
+
+            Some(HashedTransaction::new(Cow::Borrowed(tx), message_hash))
+        };
+
+        PAR_THREAD_POOL.with(|thread_pool| {
+            thread_pool.borrow().install(|| {
+                self.par_iter()
+                    .map(|entry| {
+                        if entry.transactions.is_empty() {
+                            Some(EntryType::Tick(entry.hash))
+                        } else {
+                            Some(EntryType::Transactions(
+                                entry
+                                    .transactions
+                                    .par_iter()
+                                    .map(verify_and_hash)
+                                    .collect::<Option<Vec<HashedTransaction>>>()?,
+                            ))
+                        }
+                    })
+                    .collect()
+            })
+        })
+    }
+
     fn verify_and_hash_transactions<'a>(
         &'a self,
         skip_verification: bool,
@@ -539,7 +717,7 @@ impl EntrySlice for [Entry] {
             SanitizedTransaction::try_create(Cow::Borrowed(tx), message_hash)
         };
 
-        PAR_THREAD_POOL.with(|thread_pool| {
+        let entries = PAR_THREAD_POOL.with(|thread_pool| {
             thread_pool.borrow().install(|| {
                 self.par_iter()
                     .map(|entry| {
@@ -557,7 +735,13 @@ impl EntrySlice for [Entry] {
                     })
                     .collect()
             })
-        })
+        });
+        EntrySigVerificationState {
+            verification_status: EntryVerificationStatus::Success,
+            entries,
+            device_verification_data: DeviceSigVerificationData::Cpu(),
+            verify_duration_us: 0,
+        }
     }
 
     fn start_verify(
