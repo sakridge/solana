@@ -152,6 +152,10 @@ pub struct ReplayTiming {
     process_duplicate_slots_elapsed: u64,
     process_unfrozen_gossip_verified_vote_hashes_elapsed: u64,
     repair_correct_slots_elapsed: u64,
+    failed_switch_elapsed: u64,
+    failed_switch_dupe_elapsed: u64,
+    check_switch_elapsed: u64,
+    update_fork_stats_elapsed: u64,
 }
 impl ReplayTiming {
     #[allow(clippy::too_many_arguments)]
@@ -194,6 +198,7 @@ impl ReplayTiming {
             process_unfrozen_gossip_verified_vote_hashes_elapsed;
         self.process_duplicate_slots_elapsed += process_duplicate_slots_elapsed;
         self.repair_correct_slots_elapsed += repair_correct_slots_elapsed;
+
         let now = timestamp();
         let elapsed_ms = now - self.last_print;
         if elapsed_ms > 1000 {
@@ -205,6 +210,21 @@ impl ReplayTiming {
                 (
                     "update_commitment_cache_us",
                     self.update_commitment_cache_us,
+                    i64
+                ),
+            );
+            datapoint_info!(
+                "replay-loop-select-fork-stats",
+                ("failed_switch_elapsed", self.failed_switch_elapsed, i64),
+                (
+                    "failed_switch_dupe_elapsed",
+                    self.failed_switch_dupe_elapsed,
+                    i64
+                ),
+                ("check_switch_elapsed", self.check_switch_elapsed, i64),
+                (
+                    "update_fork_stats_elapsed",
+                    self.update_fork_stats_elapsed,
                     i64
                 ),
             );
@@ -545,6 +565,7 @@ impl ReplayStage {
                         &mut tower,
                         &latest_validator_votes_for_frozen_banks,
                         &heaviest_subtree_fork_choice,
+                        &mut replay_timing,
                     );
                     select_vote_and_reset_forks_time.stop();
 
@@ -2173,6 +2194,7 @@ impl ReplayStage {
         tower: &mut Tower,
         latest_validator_votes_for_frozen_banks: &LatestValidatorVotesForFrozenBanks,
         fork_choice: &HeaviestSubtreeForkChoice,
+        replay_timing: &mut ReplayTiming,
     ) -> SelectVoteAndResetForkResult {
         // Try to vote on the actual heaviest fork. If the heaviest bank is
         // locked out or fails the threshold check, the validator will:
@@ -2189,6 +2211,7 @@ impl ReplayStage {
         //    switch_threshold succeeds
         let mut failure_reasons = vec![];
         let selected_fork = {
+            let mut check_switch_time = Measure::start("check_switch_time");
             let switch_fork_decision = tower.check_switch_threshold(
                 heaviest_bank.slot(),
                 ancestors,
@@ -2201,9 +2224,12 @@ impl ReplayStage {
                 latest_validator_votes_for_frozen_banks,
                 fork_choice,
             );
+            check_switch_time.stop();
+            replay_timing.check_switch_elapsed += check_switch_time.as_us();
 
             match switch_fork_decision {
                 SwitchForkDecision::FailedSwitchThreshold(_, _) => {
+                    let mut failed_switch_time = Measure::start("failed_switch_time");
                     let reset_bank = heaviest_bank_on_same_voted_fork;
                     // If we can't switch and our last vote was on a non-duplicate/confirmed slot, then
                     // reset to the the next votable bank on the same fork as our last vote,
@@ -2234,7 +2260,10 @@ impl ReplayStage {
                     failure_reasons.push(HeaviestForkFailures::FailedSwitchThreshold(
                         heaviest_bank.slot(),
                     ));
-                    reset_bank.map(|b| (b, switch_fork_decision))
+                    let r = reset_bank.map(|b| (b, switch_fork_decision));
+                    failed_switch_time.stop();
+                    replay_timing.failed_switch_elapsed += failed_switch_time.as_us();
+                    r
                 }
                 SwitchForkDecision::FailedSwitchDuplicateRollback(latest_duplicate_ancestor) => {
                     // If we can't switch and our last vote was on an unconfirmed, duplicate slot,
@@ -2272,6 +2301,7 @@ impl ReplayStage {
                     // Note the heaviest fork is never descended from a known unconfirmed duplicate slot
                     // because the fork choice rule ensures that (marks it as an invalid candidate),
                     // thus it's safe to use as the reset bank.
+                    let mut failed_switch_dupe_time = Measure::start("failed_switch_dupe_time");
                     let reset_bank = Some(heaviest_bank);
                     info!(
                         "Waiting to switch vote to {}, resetting to slot {:?} for now, latest duplicate ancestor: {:?}",
@@ -2282,13 +2312,17 @@ impl ReplayStage {
                     failure_reasons.push(HeaviestForkFailures::FailedSwitchThreshold(
                         heaviest_bank.slot(),
                     ));
-                    reset_bank.map(|b| (b, switch_fork_decision))
+                    let r = reset_bank.map(|b| (b, switch_fork_decision));
+                    failed_switch_dupe_time.stop();
+                    replay_timing.failed_switch_dupe_elapsed += failed_switch_dupe_time.as_us();
+                    r
                 }
                 _ => Some((heaviest_bank, switch_fork_decision)),
             }
         };
 
-        if let Some((bank, switch_fork_decision)) = selected_fork {
+        let mut update_stats_time = Measure::start("update_stats");
+        let r = if let Some((bank, switch_fork_decision)) = selected_fork {
             let (is_locked_out, vote_threshold, is_leader_slot, fork_weight) = {
                 let fork_stats = progress.get_fork_stats(bank.slot()).unwrap();
                 let propagated_stats = &progress.get_propagated_stats(bank.slot()).unwrap();
@@ -2336,7 +2370,10 @@ impl ReplayStage {
                 reset_bank: None,
                 heaviest_fork_failures: failure_reasons,
             }
-        }
+        };
+        update_stats_time.stop();
+        replay_timing.update_fork_stats_elapsed += update_stats_time.as_us();
+        r
     }
 
     fn update_fork_propagated_threshold_from_votes(
@@ -5124,6 +5161,7 @@ pub mod tests {
             &mut tower,
             &latest_validator_votes_for_frozen_banks,
             &heaviest_subtree_fork_choice,
+            &mut ReplayTiming::default(),
         )
     }
 
@@ -5251,6 +5289,7 @@ pub mod tests {
             &mut tower,
             &latest_validator_votes_for_frozen_banks,
             &heaviest_subtree_fork_choice,
+            &mut ReplayTiming::default(),
         )
     }
 
@@ -5650,6 +5689,7 @@ pub mod tests {
             tower,
             latest_validator_votes_for_frozen_banks,
             heaviest_subtree_fork_choice,
+            &mut ReplayTiming::default(),
         );
         (
             vote_bank.map(|(b, _)| b.slot()),

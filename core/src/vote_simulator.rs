@@ -7,7 +7,7 @@ use crate::{
     heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
     latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
     progress_map::{ForkProgress, ProgressMap},
-    replay_stage::{HeaviestForkFailures, ReplayStage},
+    replay_stage::{HeaviestForkFailures, ReplayStage, ReplayTiming},
     unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
 };
 use solana_runtime::{
@@ -176,6 +176,7 @@ impl VoteSimulator {
             tower,
             &self.latest_validator_votes_for_frozen_banks,
             &self.heaviest_subtree_fork_choice,
+            &mut ReplayTiming::default(),
         );
 
         // Make sure this slot isn't locked out or failing threshold
