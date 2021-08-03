@@ -5235,11 +5235,8 @@ impl AccountsDb {
                 );
                 let count = store.remove_account(account_info.stored_size, reset_accounts);
                 if count == 0 {
-                    // expected_slot is none should exclude write path from flush/shrink/bank drop
-                    if expected_slot.is_none() {
-                        self.dirty_stores
-                            .insert((*slot, store.append_vec_id()), store.clone());
-                    }
+                    self.dirty_stores
+                        .insert((*slot, store.append_vec_id()), store.clone());
                     dead_slots.insert(*slot);
                 } else if self.caching_enabled
                     && Self::is_shrinking_productive(*slot, &[store.clone()])
