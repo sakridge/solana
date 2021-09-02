@@ -22,7 +22,7 @@ use std::{
         Range, RangeBounds,
     },
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicIsize, AtomicU64, Ordering},
         Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
 };
@@ -322,15 +322,20 @@ impl<T: IsCached> WriteAccountMapEntry<T> {
     // Try to update an item in the slot list the given `slot` If an item for the slot
     // already exists in the list, remove the older item, add it to `reclaims`, and insert
     // the new item.
-    pub fn update(&mut self, slot: Slot, account_info: T, reclaims: &mut SlotList<T>) {
+    pub fn update(&mut self, slot: Slot, account_info: T, reclaims: &mut SlotList<T>) -> isize {
         let mut addref = !account_info.is_cached();
+        let mut diff: isize = 0;
         self.slot_list_mut(|list| {
+            let orig = list.capacity();
             addref = Self::update_slot_list(list, slot, account_info, reclaims, false);
+            let new = list.capacity();
+            diff = new as isize - orig as isize;
         });
         if addref {
             // If it's the first non-cache insert, also bump the stored ref count
             self.ref_count().fetch_add(1, Ordering::Relaxed);
         }
+        diff
     }
 }
 
@@ -780,6 +785,7 @@ impl ScanSlotTracker {
 #[derive(Debug)]
 pub struct AccountsIndex<T> {
     pub account_maps: LockMapType<T>,
+    pub total_entry_size: AtomicIsize,
     pub bin_calculator: PubkeyBinCalculator16,
     program_id_index: SecondaryIndex<DashMapSecondaryIndexEntry>,
     spl_token_mint_index: SecondaryIndex<DashMapSecondaryIndexEntry>,
@@ -808,6 +814,7 @@ impl<T: IsCached> AccountsIndex<T> {
         let (account_maps, bin_calculator) = Self::allocate_accounts_index(config);
         Self {
             account_maps,
+            total_entry_size: AtomicIsize::new(0),
             bin_calculator,
             program_id_index: SecondaryIndex::<DashMapSecondaryIndexEntry>::new(
                 "program_id_index_stats",
@@ -1219,6 +1226,10 @@ impl<T: IsCached> AccountsIndex<T> {
                 *account_entry.key(),
             )),
             Entry::Vacant(account_entry) => {
+                self.total_entry_size.fetch_add(
+                    new_entry.slot_list.read().unwrap().capacity() as isize,
+                    Ordering::Relaxed,
+                );
                 account_entry.insert(new_entry);
                 None
             }
@@ -1603,7 +1614,8 @@ impl<T: IsCached> AccountsIndex<T> {
                             new_item,
                         );
                         if let Some((mut w_account_entry, account_info, pubkey)) = already_exists {
-                            w_account_entry.update(slot, account_info, &mut _reclaims);
+                            let diff = w_account_entry.update(slot, account_info, &mut _reclaims);
+                            self.total_entry_size.fetch_add(diff, Ordering::Relaxed);
                             dirty_pubkeys.push(pubkey);
                         } else if is_zero_lamport {
                             dirty_pubkeys.push(pubkey);
@@ -1743,7 +1755,12 @@ impl<T: IsCached> AccountsIndex<T> {
             let mut w_maps = self.get_account_maps_write_lock(pubkey);
             if let Some(x) = w_maps.get(pubkey) {
                 if x.slot_list.read().unwrap().is_empty() {
-                    w_maps.remove(pubkey);
+                    if let Some(removed) = w_maps.remove(pubkey) {
+                        self.total_entry_size.fetch_sub(
+                            removed.slot_list.read().unwrap().capacity() as isize,
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
             }
         }

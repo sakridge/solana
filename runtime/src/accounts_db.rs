@@ -4637,6 +4637,14 @@ impl AccountsDb {
             0.
         };
 
+        let index_size = self.accounts_index.account_maps.capacity();
+        let index_len = self
+            .accounts_index
+            .account_maps
+            .iter()
+            .map(|r| r.read().unwrap().capacity())
+            .sum::<usize>();
+        let index_entry_size = self.accounts_index.total_entry_size.load(Ordering::Relaxed);
         datapoint_info!(
             "accounts_db-stores",
             ("total_count", total_count, i64),
@@ -4648,6 +4656,9 @@ impl AccountsDb {
             ("total_bytes", total_bytes, i64),
             ("total_alive_bytes", total_alive_bytes, i64),
             ("total_alive_ratio", total_alive_ratio, f64),
+            ("index_size", index_size, i64),
+            ("index_len", index_len, i64),
+            ("index_entry_size", index_entry_size, i64),
         );
         datapoint_info!(
             "accounts_db-perf-stats",
