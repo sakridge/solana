@@ -47,6 +47,7 @@ impl ValidatorVoteKeypairs {
     }
 }
 
+#[derive(Debug)]
 pub struct GenesisConfigInfo {
     pub genesis_config: GenesisConfig,
     pub mint_keypair: Keypair,

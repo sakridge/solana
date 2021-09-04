@@ -50,7 +50,7 @@ pub struct SendDroppedBankCallback {
 impl DropCallback for SendDroppedBankCallback {
     fn callback(&self, bank: &Bank) {
         if let Err(e) = self.sender.send(bank.slot()) {
-            warn!("Error sending dropped banks: {:?}", e);
+            //warn!("Error sending dropped banks: {:?}", e);
         }
     }
 

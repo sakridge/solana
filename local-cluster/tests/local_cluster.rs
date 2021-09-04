@@ -140,6 +140,56 @@ fn test_spend_and_verify_all_nodes_2() {
 
 #[test]
 #[serial]
+fn test_forwarding_dos() {
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    error!("test_spend_and_verify_all_nodes_2");
+    let num_nodes = 2;
+    let validator_config = ValidatorConfig::default();
+    let mut config = ClusterConfig {
+        cluster_lamports: 10_000,
+        node_stakes: vec![1, 100_000],
+        validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
+        ..ClusterConfig::default()
+    };
+
+    let cluster = LocalCluster::new(&mut config);
+
+    let nodes = cluster.get_node_pubkeys();
+
+    // Get non leader
+    let non_bootstrap_id = nodes
+        .into_iter()
+        .find(|id| *id != cluster.entry_point_info.id)
+        .unwrap();
+    let non_bootstrap_info = cluster.get_contact_info(&non_bootstrap_id).unwrap();
+
+    let tx_client = create_client(
+        non_bootstrap_info.client_facing_addr(),
+        VALIDATOR_PORT_RANGE,
+    );
+
+    let (blockhash, _fee_calculator, _last_valid_slot) = tx_client
+        .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
+        .unwrap();
+
+    for i in 1..100 {
+        let mut transaction = system_transaction::transfer(
+            &cluster.funding_keypair,
+            &solana_sdk::pubkey::new_rand(),
+            1,
+            blockhash,
+        );
+
+        tx_client
+            .retry_transfer(&cluster.funding_keypair, &mut transaction, 5)
+            .unwrap();
+    }
+
+}
+
+
+#[test]
+#[serial]
 fn test_spend_and_verify_all_nodes_3() {
     solana_logger::setup_with_default(RUST_LOG_FILTER);
     error!("test_spend_and_verify_all_nodes_3");

@@ -332,7 +332,11 @@ impl BankingStage {
         });
         for p in packets {
             if data_budget.take(p.meta.size) {
+                info!("sending: {}", p.meta.size);
                 socket.send_to(&p.data[..p.meta.size], &tpu_forwards)?;
+            } else {
+                info!("not sending {}", p.meta.size);
+                break;
             }
         }
 
@@ -586,10 +590,12 @@ impl BankingStage {
             return;
         }
 
+        info!("next leader?");
         let addr = match next_leader_tpu_forwards(cluster_info, poh_recorder) {
             Some(addr) => addr,
             None => return,
         };
+        info!("found leader: {:?}", addr);
         let _ = Self::forward_buffered_packets(socket, &addr, buffered_packets, data_budget);
         if hold {
             buffered_packets.retain(|(_, index, _)| !index.is_empty());
@@ -1406,8 +1412,11 @@ fn next_leader_tpu_forwards(
         .unwrap()
         .leader_after_n_slots(FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET)
     {
-        cluster_info.lookup_contact_info(&leader_pubkey, |leader| leader.tpu_forwards)
+        let x = cluster_info.lookup_contact_info(&leader_pubkey, |leader| leader.tpu_forwards);
+        info!("leader: {:?} x: {:?}", leader_pubkey, x);
+        x
     } else {
+        info!("no leader");
         None
     }
 }
@@ -2724,9 +2733,12 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
+        let node = Node::new_localhost();
+        info!("{:#?}", node);
+        let cluster_info = ClusterInfo::new_with_invalid_keypair(node.info);
 
         let genesis_config_info = create_slow_genesis_config(10_000);
+        info!("genesis_config: {:#?}", genesis_config_info);
         let GenesisConfigInfo { genesis_config, .. } = &genesis_config_info;
 
         let bank = Arc::new(Bank::new_no_wallclock_throttle(&genesis_config));
@@ -2757,6 +2769,7 @@ mod tests {
                 false,
                 &data_budget,
             );
+            info!("sent stuff.... now quiting");
             exit.store(true, Ordering::Relaxed);
             poh_service.join().unwrap();
         }
