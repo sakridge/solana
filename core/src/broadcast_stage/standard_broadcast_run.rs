@@ -4,7 +4,7 @@ use super::{
     broadcast_utils::{self, ReceiveResults},
     *,
 };
-use crate::{broadcast_stage::broadcast_utils::UnfinishedSlotInfo, cluster_nodes::ClusterNodes};
+use crate::broadcast_stage::broadcast_utils::UnfinishedSlotInfo;
 use solana_ledger::{
     entry::Entry,
     shred::{
@@ -31,8 +31,14 @@ pub struct StandardBroadcastRun {
     shred_version: u16,
     last_datapoint_submit: Arc<AtomicInterval>,
     num_batches: usize,
-    cluster_nodes: Arc<RwLock<ClusterNodes<BroadcastStage>>>,
+    broadcast_peer_cache: Arc<RwLock<BroadcastPeerCache>>,
     last_peer_update: Arc<AtomicInterval>,
+}
+
+#[derive(Default)]
+struct BroadcastPeerCache {
+    peers: Vec<ContactInfo>,
+    peers_and_stakes: Vec<(u64, usize)>,
 }
 
 impl StandardBroadcastRun {
@@ -48,7 +54,7 @@ impl StandardBroadcastRun {
             shred_version,
             last_datapoint_submit: Arc::default(),
             num_batches: 0,
-            cluster_nodes: Arc::default(),
+            broadcast_peer_cache: Arc::default(),
             last_peer_update: Arc::new(AtomicInterval::default()),
         }
     }
@@ -347,13 +353,13 @@ impl StandardBroadcastRun {
             .last_peer_update
             .should_update_ext(BROADCAST_PEER_UPDATE_INTERVAL_MS, false)
         {
-            *self.cluster_nodes.write().unwrap() = ClusterNodes::<BroadcastStage>::new(
-                cluster_info,
-                stakes.unwrap_or(&HashMap::default()),
-            );
+            let mut w_broadcast_peer_cache = self.broadcast_peer_cache.write().unwrap();
+            let (peers, peers_and_stakes) = get_broadcast_peers(cluster_info, stakes);
+            w_broadcast_peer_cache.peers = peers;
+            w_broadcast_peer_cache.peers_and_stakes = peers_and_stakes;
         }
         get_peers_time.stop();
-        let cluster_nodes = self.cluster_nodes.read().unwrap();
+        let r_broadcast_peer_cache = self.broadcast_peer_cache.read().unwrap();
 
         let mut transmit_stats = TransmitShredsStats::default();
         // Broadcast the shreds
@@ -361,12 +367,13 @@ impl StandardBroadcastRun {
         broadcast_shreds(
             sock,
             &shreds,
-            &cluster_nodes,
+            &r_broadcast_peer_cache.peers_and_stakes,
+            &r_broadcast_peer_cache.peers,
             &self.last_datapoint_submit,
             &mut transmit_stats,
             cluster_info.socket_addr_space(),
         )?;
-        drop(cluster_nodes);
+        drop(r_broadcast_peer_cache);
         transmit_time.stop();
 
         transmit_stats.transmit_elapsed = transmit_time.as_us();

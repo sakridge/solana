@@ -6,15 +6,17 @@ use self::{
     fail_entry_verification_broadcast_run::FailEntryVerificationBroadcastRun,
     standard_broadcast_run::StandardBroadcastRun,
 };
-use crate::{
-    cluster_nodes::ClusterNodes,
-    result::{Error, Result},
-};
+use crate::result::{Error, Result};
 use crossbeam_channel::{
     Receiver as CrossbeamReceiver, RecvTimeoutError as CrossbeamRecvTimeoutError,
     Sender as CrossbeamSender,
 };
-use solana_gossip::cluster_info::{ClusterInfo, ClusterInfoError};
+use solana_gossip::{
+    cluster_info::{self, ClusterInfo, ClusterInfoError},
+    contact_info::ContactInfo,
+    crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
+    weighted_shuffle::weighted_best,
+};
 use solana_ledger::{blockstore::Blockstore, shred::Shred};
 use solana_measure::measure::Measure;
 use solana_metrics::{inc_new_counter_error, inc_new_counter_info};
@@ -372,17 +374,27 @@ fn update_peer_stats(
     }
 }
 
+pub fn get_broadcast_peers(
+    cluster_info: &ClusterInfo,
+    stakes: Option<&HashMap<Pubkey, u64>>,
+) -> (Vec<ContactInfo>, Vec<(u64, usize)>) {
+    let mut peers = cluster_info.tvu_peers();
+    let peers_and_stakes = cluster_info::stake_weight_peers(&mut peers, stakes);
+    (peers, peers_and_stakes)
+}
+
 /// broadcast messages from the leader to layer 1 nodes
 /// # Remarks
 pub fn broadcast_shreds(
     s: &UdpSocket,
     shreds: &[Shred],
-    cluster_nodes: &ClusterNodes<BroadcastStage>,
+    peers_and_stakes: &[(u64, usize)],
+    peers: &[ContactInfo],
     last_datapoint_submit: &Arc<AtomicInterval>,
     transmit_stats: &mut TransmitShredsStats,
     socket_addr_space: &SocketAddrSpace,
 ) -> Result<()> {
-    let broadcast_len = cluster_nodes.num_peers();
+    let broadcast_len = peers_and_stakes.len();
     if broadcast_len == 0 {
         update_peer_stats(1, 1, last_datapoint_submit);
         return Ok(());
@@ -391,9 +403,9 @@ pub fn broadcast_shreds(
     let packets: Vec<_> = shreds
         .iter()
         .filter_map(|shred| {
-            let node = cluster_nodes.get_broadcast_peer(shred.seed())?;
-            if socket_addr_space.check(&node.tvu) {
-                Some((&shred.payload, &node.tvu))
+            let broadcast_index = weighted_best(peers_and_stakes, shred.seed());
+            if socket_addr_space.check(&peers[broadcast_index].tvu) {
+                Some((&shred.payload, &peers[broadcast_index].tvu))
             } else {
                 None
             }
@@ -415,13 +427,32 @@ pub fn broadcast_shreds(
     send_mmsg_time.stop();
     transmit_stats.send_mmsg_elapsed += send_mmsg_time.as_us();
 
-    let num_live_peers = cluster_nodes.num_peers_live(timestamp()) as i64;
+    let num_live_peers = num_live_peers(peers);
     update_peer_stats(
         num_live_peers,
         broadcast_len as i64 + 1,
         last_datapoint_submit,
     );
     Ok(())
+}
+
+fn distance(a: u64, b: u64) -> u64 {
+    if a > b {
+        a - b
+    } else {
+        b - a
+    }
+}
+
+fn num_live_peers(peers: &[ContactInfo]) -> i64 {
+    let mut num_live_peers = 1i64;
+    peers.iter().for_each(|p| {
+        // A peer is considered live if they generated their contact info recently
+        if distance(timestamp(), p.wallclock) <= CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS {
+            num_live_peers += 1;
+        }
+    });
+    num_live_peers
 }
 
 #[cfg(test)]
@@ -505,6 +536,19 @@ pub mod test {
 
         assert_eq!(num_expected_data_shreds, data_index);
         assert_eq!(num_expected_coding_shreds, coding_index);
+    }
+
+    #[test]
+    fn test_num_live_peers() {
+        let mut ci = ContactInfo {
+            wallclock: std::u64::MAX,
+            ..ContactInfo::default()
+        };
+        assert_eq!(num_live_peers(&[ci.clone()]), 1);
+        ci.wallclock = timestamp() - 1;
+        assert_eq!(num_live_peers(&[ci.clone()]), 2);
+        ci.wallclock = timestamp() - CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS - 1;
+        assert_eq!(num_live_peers(&[ci]), 1);
     }
 
     #[test]

@@ -3,7 +3,6 @@
 
 use crate::{
     cluster_info_vote_listener::VerifiedVoteReceiver,
-    cluster_nodes::ClusterNodes,
     cluster_slots::ClusterSlots,
     cluster_slots_service::{ClusterSlotsService, ClusterSlotsUpdateReceiver},
     completed_data_sets_service::CompletedDataSetsSender,
@@ -14,7 +13,10 @@ use crate::{
 use crossbeam_channel::{Receiver, Sender};
 use lru::LruCache;
 use solana_client::rpc_response::SlotUpdate;
-use solana_gossip::cluster_info::{ClusterInfo, DATA_PLANE_FANOUT};
+use solana_gossip::{
+    cluster_info::{compute_retransmit_peers, ClusterInfo, DATA_PLANE_FANOUT},
+    contact_info::ContactInfo,
+};
 use solana_ledger::shred::{get_shred_slot_index_type, ShredFetchStats};
 use solana_ledger::{
     blockstore::{Blockstore, CompletedSlotsReceiver},
@@ -36,6 +38,7 @@ use solana_sdk::{
 };
 use solana_streamer::streamer::PacketReceiver;
 use std::{
+    cmp,
     collections::hash_set::HashSet,
     collections::{BTreeMap, BTreeSet, HashMap},
     net::UdpSocket,
@@ -214,6 +217,12 @@ fn update_retransmit_stats(
     }
 }
 
+#[derive(Default)]
+struct EpochStakesCache {
+    peers: Vec<ContactInfo>,
+    stakes_and_index: Vec<(u64, usize)>,
+}
+
 use crate::packet_hasher::PacketHasher;
 // Map of shred (slot, index, is_data) => list of hash values seen for that key.
 pub type ShredFilter = LruCache<(Slot, u32, bool), Vec<u64>>;
@@ -274,6 +283,33 @@ fn check_if_first_shred_received(
     }
 }
 
+// Drops shred slot leader from retransmit peers.
+// TODO: decide which bank should be used here.
+fn get_retransmit_peers(
+    self_pubkey: Pubkey,
+    shred_slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: &Bank,
+    stakes_cache: &EpochStakesCache,
+) -> Vec<(u64 /*stakes*/, usize /*index*/)> {
+    match leader_schedule_cache.slot_leader_at(shred_slot, Some(bank)) {
+        None => {
+            error!("unknown leader for shred slot");
+            stakes_cache.stakes_and_index.clone()
+        }
+        Some(pubkey) if pubkey == self_pubkey => {
+            error!("retransmit from slot leader: {}", pubkey);
+            stakes_cache.stakes_and_index.clone()
+        }
+        Some(pubkey) => stakes_cache
+            .stakes_and_index
+            .iter()
+            .filter(|(_, i)| stakes_cache.peers[*i].id != pubkey)
+            .copied()
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn retransmit(
     bank_forks: &RwLock<BankForks>,
@@ -283,7 +319,7 @@ fn retransmit(
     sock: &UdpSocket,
     id: u32,
     stats: &RetransmitStats,
-    cluster_nodes: &RwLock<ClusterNodes<RetransmitStage>>,
+    epoch_stakes_cache: &RwLock<EpochStakesCache>,
     last_peer_update: &AtomicInterval,
     shreds_received: &Mutex<ShredFilterAndHasher>,
     max_slots: &MaxSlots,
@@ -316,18 +352,21 @@ fn retransmit(
     let mut epoch_cache_update = Measure::start("retransmit_epoch_cach_update");
     if last_peer_update.should_update_ext(1000, false) {
         let epoch_staked_nodes = r_bank.epoch_staked_nodes(bank_epoch);
-        *cluster_nodes.write().unwrap() = ClusterNodes::<RetransmitStage>::new(
-            cluster_info,
-            &epoch_staked_nodes.unwrap_or_default(),
-        );
+        let (peers, stakes_and_index) =
+            cluster_info.sorted_retransmit_peers_and_stakes(epoch_staked_nodes.as_ref());
+        {
+            let mut epoch_stakes_cache = epoch_stakes_cache.write().unwrap();
+            epoch_stakes_cache.peers = peers;
+            epoch_stakes_cache.stakes_and_index = stakes_and_index;
+        }
         {
             let mut sr = shreds_received.lock().unwrap();
             sr.0.clear();
             sr.1.reset();
         }
     }
-    let cluster_nodes = cluster_nodes.read().unwrap();
-    let peers_len = cluster_nodes.num_peers();
+    let r_epoch_stakes_cache = epoch_stakes_cache.read().unwrap();
+    let mut peers_len = 0;
     epoch_cache_update.stop();
 
     let my_id = cluster_info.id();
@@ -368,18 +407,52 @@ fn retransmit(
         }
 
         let mut compute_turbine_peers = Measure::start("turbine_start");
-        let slot_leader = leader_schedule_cache.slot_leader_at(shred_slot, Some(r_bank.deref()));
-        let (neighbors, children) =
-            cluster_nodes.get_retransmit_peers(packet.meta.seed, DATA_PLANE_FANOUT, slot_leader);
+        let stakes_and_index = get_retransmit_peers(
+            my_id,
+            shred_slot,
+            leader_schedule_cache,
+            r_bank.deref(),
+            r_epoch_stakes_cache.deref(),
+        );
+        let (my_index, shuffled_stakes_and_index) = ClusterInfo::shuffle_peers_and_index(
+            &my_id,
+            &r_epoch_stakes_cache.peers,
+            &stakes_and_index,
+            packet.meta.seed,
+        );
         // If the node is on the critical path (i.e. the first node in each
         // neighborhood), then we expect that the packet arrives at tvu socket
         // as opposed to tvu-forwards. If this is not the case, then the
         // turbine broadcast/retransmit tree is mismatched across nodes.
-        let anchor_node = neighbors[0].id == my_id;
+        let anchor_node = my_index % DATA_PLANE_FANOUT == 0;
         if packet.meta.forward == anchor_node {
             // TODO: Consider forwarding the packet to the root node here.
             retransmit_tree_mismatch += 1;
         }
+        peers_len = cmp::max(peers_len, shuffled_stakes_and_index.len());
+        // split off the indexes, we don't need the stakes anymore
+        let indexes: Vec<_> = shuffled_stakes_and_index
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect();
+        debug_assert_eq!(my_id, r_epoch_stakes_cache.peers[indexes[my_index]].id);
+
+        let (neighbors, children) = compute_retransmit_peers(DATA_PLANE_FANOUT, my_index, &indexes);
+        let neighbors: Vec<_> = neighbors
+            .into_iter()
+            .filter_map(|index| {
+                let peer = &r_epoch_stakes_cache.peers[index];
+                if peer.id == my_id {
+                    None
+                } else {
+                    Some(peer)
+                }
+            })
+            .collect();
+        let children: Vec<_> = children
+            .into_iter()
+            .map(|index| &r_epoch_stakes_cache.peers[index])
+            .collect();
         compute_turbine_peers.stop();
         compute_turbine_peers_total += compute_turbine_peers.as_us();
 
@@ -394,9 +467,8 @@ fn retransmit(
         // children and also tvu_forward socket of its neighbors. Otherwise it
         // should only forward to tvu_forward socket of its children.
         if anchor_node {
-            // First neighbor is this node itself, so skip it.
             ClusterInfo::retransmit_to(
-                &neighbors[1..],
+                &neighbors,
                 packet,
                 sock,
                 /*forward socket=*/ true,
@@ -472,7 +544,7 @@ pub fn retransmitter(
             let r = r.clone();
             let cluster_info = cluster_info.clone();
             let stats = stats.clone();
-            let cluster_nodes = Arc::default();
+            let epoch_stakes_cache = Arc::new(RwLock::new(EpochStakesCache::default()));
             let last_peer_update = Arc::new(AtomicInterval::default());
             let shreds_received = shreds_received.clone();
             let max_slots = max_slots.clone();
@@ -492,7 +564,7 @@ pub fn retransmitter(
                             &sockets[s],
                             s as u32,
                             &stats,
-                            &cluster_nodes,
+                            &epoch_stakes_cache,
                             &last_peer_update,
                             &shreds_received,
                             &max_slots,

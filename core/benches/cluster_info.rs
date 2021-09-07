@@ -3,14 +3,10 @@
 extern crate test;
 
 use rand::{thread_rng, Rng};
-use solana_core::{
-    broadcast_stage::{broadcast_metrics::TransmitShredsStats, broadcast_shreds, BroadcastStage},
-    cluster_nodes::ClusterNodes,
-};
-use solana_gossip::{
-    cluster_info::{ClusterInfo, Node},
-    contact_info::ContactInfo,
-};
+use solana_core::broadcast_stage::broadcast_metrics::TransmitShredsStats;
+use solana_core::broadcast_stage::{broadcast_shreds, get_broadcast_peers};
+use solana_gossip::cluster_info::{ClusterInfo, Node};
+use solana_gossip::contact_info::ContactInfo;
 use solana_ledger::shred::Shred;
 use solana_sdk::{
     pubkey,
@@ -44,7 +40,7 @@ fn broadcast_shreds_bench(bencher: &mut Bencher) {
         stakes.insert(id, thread_rng().gen_range(1, NUM_PEERS) as u64);
     }
     let cluster_info = Arc::new(cluster_info);
-    let cluster_nodes = ClusterNodes::<BroadcastStage>::new(&cluster_info, &stakes);
+    let (peers, peers_and_stakes) = get_broadcast_peers(&cluster_info, Some(&stakes));
     let shreds = Arc::new(shreds);
     let last_datapoint = Arc::new(AtomicInterval::default());
     bencher.iter(move || {
@@ -52,7 +48,8 @@ fn broadcast_shreds_bench(bencher: &mut Bencher) {
         broadcast_shreds(
             &socket,
             &shreds,
-            &cluster_nodes,
+            &peers_and_stakes,
+            &peers,
             &last_datapoint,
             &mut TransmitShredsStats::default(),
             &SocketAddrSpace::Unspecified,
