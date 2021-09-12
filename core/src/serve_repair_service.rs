@@ -34,7 +34,6 @@ impl ServeRepairService {
             Recycler::default(),
             "serve_repair_receiver",
             1,
-            false,
         );
         let (response_sender, response_receiver) = channel();
         let t_responder = streamer::responder(

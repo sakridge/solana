@@ -56,7 +56,6 @@ impl GossipService {
             Recycler::default(),
             "gossip_receiver",
             1,
-            false,
         );
         let (consume_sender, listen_receiver) = channel();
         // https://github.com/rust-lang/rust/issues/39364#issuecomment-634545136

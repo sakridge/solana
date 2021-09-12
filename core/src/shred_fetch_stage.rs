@@ -150,7 +150,6 @@ impl ShredFetchStage {
                     recycler.clone(),
                     "packet_modifier",
                     1,
-                    true,
                 )
             })
             .collect();
