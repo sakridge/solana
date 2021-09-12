@@ -2,6 +2,7 @@
 
 use crate::banking_stage::HOLD_TRANSACTIONS_SLOT_OFFSET;
 use crate::result::{Error, Result};
+use solana_measure::thread_mem_usage;
 use solana_metrics::{inc_new_counter_debug, inc_new_counter_info};
 use solana_perf::packet::PacketsRecycler;
 use solana_perf::recycler::Recycler;
@@ -136,6 +137,7 @@ impl FetchStage {
         let fwd_thread_hdl = Builder::new()
             .name("solana-fetch-stage-fwd-rcvr".to_string())
             .spawn(move || loop {
+                thread_mem_usage::datapoint("solana-fetch-stage-fwd-rcvr");
                 if let Err(e) =
                     Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder)
                 {

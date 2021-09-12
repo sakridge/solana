@@ -8,7 +8,7 @@ use lru::LruCache;
 use retain_mut::RetainMut;
 use solana_gossip::cluster_info::ClusterInfo;
 use solana_ledger::{blockstore_processor::TransactionStatusSender, entry::hash_transactions};
-use solana_measure::measure::Measure;
+use solana_measure::{measure::Measure, thread_mem_usage};
 use solana_metrics::{inc_new_counter_debug, inc_new_counter_info};
 use solana_perf::{
     cuda_runtime::PinnedVec,
@@ -259,6 +259,7 @@ impl BankingStage {
                 Builder::new()
                     .name("solana-banking-stage-tx".to_string())
                     .spawn(move || {
+                        thread_mem_usage::datapoint("solana-banking-stage-tx");
                         Self::process_loop(
                             my_pubkey,
                             &verified_receiver,

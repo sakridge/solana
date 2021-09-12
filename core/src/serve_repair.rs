@@ -21,7 +21,8 @@ use solana_ledger::{
     shred::{Nonce, Shred},
 };
 use solana_measure::measure::Measure;
-use solana_metrics::inc_new_counter_debug;
+use solana_measure::thread_mem_usage;
+use solana_metrics::{datapoint_debug, inc_new_counter_debug};
 use solana_perf::packet::{limited_deserialize, Packets, PacketsRecycler};
 use solana_sdk::{
     clock::Slot,
@@ -365,6 +366,7 @@ impl ServeRepair {
                         Self::report_reset_stats(&me, &mut stats);
                         last_print = Instant::now();
                     }
+                    thread_mem_usage::datapoint("solana-repair-listen");
                 }
             })
             .unwrap()
@@ -379,7 +381,9 @@ impl ServeRepair {
         stats: &mut ServeRepairStats,
     ) {
         // iter over the packets
+        let allocated = thread_mem_usage::Allocatedp::default();
         packets.packets.iter().for_each(|packet| {
+            let start = allocated.get();
             let from_addr = packet.meta.addr();
             limited_deserialize(&packet.data[..packet.meta.size])
                 .into_iter()
@@ -391,6 +395,10 @@ impl ServeRepair {
                         let _ignore_disconnect = response_sender.send(rsp);
                     }
                 });
+            datapoint_debug!(
+                "solana-serve-repair-memory",
+                ("serve_repair", (allocated.get() - start) as i64, i64),
+            );
         });
     }
 
