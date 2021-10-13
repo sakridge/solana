@@ -158,6 +158,9 @@ pub(crate) fn should_retransmit_and_persist(
         } else if shred.index() >= MAX_DATA_SHREDS_PER_SLOT as u32 {
             inc_new_counter_warn!("streamer-recv_window-shred_index_overrun", 1);
             false
+        } else if shred.data_header.size as usize > shred.payload.len() {
+            inc_new_counter_warn!("streamer-recv_window-shred_bad_meta_size", 1);
+            false
         } else {
             true
         }
@@ -785,6 +788,16 @@ mod test {
 
         // with a Bank and no idea who leader is, shred gets thrown out
         shreds[0].set_slot(MINIMUM_SLOTS_PER_EPOCH as u64 * 3);
+        assert!(!should_retransmit_and_persist(
+            &shreds[0],
+            Some(bank.clone()),
+            &cache,
+            &me_id,
+            0,
+            0
+        ));
+
+        shreds[0].data_header.size = (shreds[0].payload.len() + 1) as u16;
         assert!(!should_retransmit_and_persist(
             &shreds[0],
             Some(bank.clone()),
