@@ -1661,7 +1661,7 @@ pub mod tests {
             );
             let message = solana_sdk::message::Message::new(&[instruction], Some(&from_pubkey));
             let mut tx = solana_sdk::transaction::Transaction::new_unsigned(message);
-            // Also randomize the signatre bytes.
+            // Also randomize the signature bytes.
             let mut signature = [0u8; 64];
             rng.fill(&mut signature[..]);
             tx.signatures = vec![Signature::new(&signature)];
