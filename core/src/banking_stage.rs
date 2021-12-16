@@ -90,7 +90,6 @@ pub struct BankingStageStats {
     last_report: AtomicInterval,
     id: u32,
     process_packets_count: AtomicUsize,
-    new_tx_count: AtomicUsize,
     dropped_packet_batches_count: AtomicUsize,
     dropped_packets_count: AtomicUsize,
     dropped_duplicated_packets_count: AtomicUsize,
@@ -127,11 +126,6 @@ impl BankingStageStats {
                 (
                     "process_packets_count",
                     self.process_packets_count.swap(0, Ordering::Relaxed) as i64,
-                    i64
-                ),
-                (
-                    "new_tx_count",
-                    self.new_tx_count.swap(0, Ordering::Relaxed) as i64,
                     i64
                 ),
                 (
@@ -722,20 +716,14 @@ impl BankingStage {
             };
 
             match Self::process_packets(
-                &my_pubkey,
                 verified_receiver,
-                poh_recorder,
                 recv_start,
                 recv_timeout,
                 id,
                 batch_limit,
-                transaction_status_sender.clone(),
-                &gossip_vote_sender,
                 &mut buffered_packet_batches,
                 &banking_stage_stats,
                 duplicates,
-                &recorder,
-                &qos_service,
             ) {
                 Ok(()) | Err(RecvTimeoutError::Timeout) => (),
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -1283,20 +1271,14 @@ impl BankingStage {
     #[allow(clippy::too_many_arguments)]
     /// Process the incoming packets
     fn process_packets(
-        my_pubkey: &Pubkey,
         verified_receiver: &CrossbeamReceiver<Vec<PacketBatch>>,
-        poh: &Arc<Mutex<PohRecorder>>,
         recv_start: &mut Instant,
         recv_timeout: Duration,
         id: u32,
         batch_limit: usize,
-        transaction_status_sender: Option<TransactionStatusSender>,
-        gossip_vote_sender: &ReplayVoteSender,
         buffered_packet_batches: &mut UnprocessedPacketBatches,
         banking_stage_stats: &BankingStageStats,
         duplicates: &Arc<Mutex<(LruCache<u64, ()>, PacketHasher)>>,
-        recorder: &TransactionRecorder,
-        qos_service: &Arc<QosService>,
     ) -> Result<(), RecvTimeoutError> {
         let mut recv_time = Measure::start("process_packets_recv");
         let packet_batches = verified_receiver.recv_timeout(recv_timeout)?;
@@ -1313,57 +1295,17 @@ impl BankingStage {
         );
         inc_new_counter_debug!("banking_stage-transactions_received", packet_count);
         let mut proc_start = Measure::start("process_packets_transactions_process");
-        let mut new_tx_count = 0;
 
-        let mut packet_batch_iter = packet_batches.into_iter();
+        let packet_batch_iter = packet_batches.into_iter();
         let mut dropped_packets_count = 0;
         let mut dropped_packet_batches_count = 0;
         let mut newly_buffered_packets_count = 0;
-        while let Some(packet_batch) = packet_batch_iter.next() {
+        for packet_batch in packet_batch_iter {
             let packet_indexes = Self::generate_packet_indexes(&packet_batch.packets);
-            let poh_recorder_bank = poh.lock().unwrap().get_poh_recorder_bank();
-            let working_bank_start = poh_recorder_bank.working_bank_start();
-            if PohRecorder::get_working_bank_if_not_expired(&working_bank_start).is_none() {
-                Self::push_unprocessed(
-                    buffered_packet_batches,
-                    packet_batch,
-                    packet_indexes,
-                    &mut dropped_packet_batches_count,
-                    &mut dropped_packets_count,
-                    &mut newly_buffered_packets_count,
-                    batch_limit,
-                    duplicates,
-                    banking_stage_stats,
-                );
-                continue;
-            }
-
-            // Destructure the `BankStart` behind an Arc
-            let BankStart {
-                working_bank,
-                bank_creation_time,
-            } = &*working_bank_start.unwrap();
-
-            let (processed, verified_txs_len, unprocessed_indexes) =
-                Self::process_packets_transactions(
-                    working_bank,
-                    bank_creation_time,
-                    recorder,
-                    &packet_batch,
-                    packet_indexes,
-                    transaction_status_sender.clone(),
-                    gossip_vote_sender,
-                    banking_stage_stats,
-                    qos_service,
-                );
-
-            new_tx_count += processed;
-
-            // Collect any unprocessed transactions in this batch for forwarding
             Self::push_unprocessed(
                 buffered_packet_batches,
                 packet_batch,
-                unprocessed_indexes,
+                packet_indexes,
                 &mut dropped_packet_batches_count,
                 &mut dropped_packets_count,
                 &mut newly_buffered_packets_count,
@@ -1371,50 +1313,14 @@ impl BankingStage {
                 duplicates,
                 banking_stage_stats,
             );
-
-            // If there were retryable transactions, add the unexpired ones to the buffered queue
-            if processed < verified_txs_len {
-                let mut handle_retryable_packets_time = Measure::start("handle_retryable_packets");
-                let next_leader = poh.lock().unwrap().next_slot_leader();
-                // Walk thru rest of the transactions and filter out the invalid (e.g. too old) ones
-                #[allow(clippy::while_let_on_iterator)]
-                while let Some(packet_batch) = packet_batch_iter.next() {
-                    let packet_indexes = Self::generate_packet_indexes(&packet_batch.packets);
-                    let unprocessed_indexes = Self::filter_unprocessed_packets(
-                        working_bank,
-                        &packet_batch,
-                        &packet_indexes,
-                        my_pubkey,
-                        next_leader,
-                        banking_stage_stats,
-                    );
-                    Self::push_unprocessed(
-                        buffered_packet_batches,
-                        packet_batch,
-                        unprocessed_indexes,
-                        &mut dropped_packet_batches_count,
-                        &mut dropped_packets_count,
-                        &mut newly_buffered_packets_count,
-                        batch_limit,
-                        duplicates,
-                        banking_stage_stats,
-                    );
-                }
-                handle_retryable_packets_time.stop();
-                banking_stage_stats
-                    .handle_retryable_packets_elapsed
-                    .fetch_add(handle_retryable_packets_time.as_us(), Ordering::Relaxed);
-            }
         }
         proc_start.stop();
 
         debug!(
-            "@{:?} done processing transaction batches: {} time: {:?}ms tx count: {} tx/s: {} total count: {} id: {}",
+            "@{:?} done processing transaction batches: {} time: {:?}ms total count: {} id: {}",
             timestamp(),
             packet_batches_len,
             proc_start.as_ms(),
-            new_tx_count,
-            (new_tx_count as f32) / (proc_start.as_s()),
             packet_count,
             id,
         );
@@ -1424,9 +1330,6 @@ impl BankingStage {
         banking_stage_stats
             .process_packets_count
             .fetch_add(packet_count, Ordering::Relaxed);
-        banking_stage_stats
-            .new_tx_count
-            .fetch_add(new_tx_count, Ordering::Relaxed);
         banking_stage_stats
             .dropped_packet_batches_count
             .fetch_add(dropped_packet_batches_count, Ordering::Relaxed);
