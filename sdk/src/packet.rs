@@ -28,6 +28,7 @@ pub struct Meta {
     pub slot: Slot,
     pub is_tracer_tx: bool,
     pub is_simple_vote_tx: bool,
+    pub weight: u64,
 }
 
 #[derive(Clone)]

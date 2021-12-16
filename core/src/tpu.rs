@@ -12,6 +12,7 @@ use {
         fetch_stage::FetchStage,
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
+        transaction_weighting_stage::TransactionWeightStage,
     },
     crossbeam_channel::unbounded,
     solana_gossip::cluster_info::ClusterInfo,
@@ -46,6 +47,8 @@ pub struct Tpu {
     banking_stage: BankingStage,
     cluster_info_vote_listener: ClusterInfoVoteListener,
     broadcast_stage: BroadcastStage,
+    transaction_weight_stage: TransactionWeightStage,
+    vote_transaction_weight_stage: TransactionWeightStage,
 }
 
 impl Tpu {
@@ -88,11 +91,30 @@ impl Tpu {
             poh_recorder,
             tpu_coalesce_ms,
         );
+
+        let (weighted_sender, weighted_receiver) = channel();
+
+        let transaction_weight_stage = TransactionWeightStage::new(
+            packet_receiver,
+            weighted_sender,
+            bank_forks.clone(),
+            cluster_info.clone(),
+        );
+
+        let (vote_weighted_sender, vote_weighted_receiver) = channel();
+
+        let vote_transaction_weight_stage = TransactionWeightStage::new(
+            vote_packet_receiver,
+            vote_weighted_sender,
+            bank_forks.clone(),
+            cluster_info.clone(),
+        );
+
         let (verified_sender, verified_receiver) = unbounded();
 
         let sigverify_stage = {
             let verifier = TransactionSigVerifier::default();
-            SigVerifyStage::new(packet_receiver, verified_sender, verifier)
+            SigVerifyStage::new(weighted_receiver, verified_sender, verifier)
         };
 
         let (verified_tpu_vote_packets_sender, verified_tpu_vote_packets_receiver) = unbounded();
@@ -100,7 +122,7 @@ impl Tpu {
         let vote_sigverify_stage = {
             let verifier = TransactionSigVerifier::new_reject_non_vote();
             SigVerifyStage::new(
-                vote_packet_receiver,
+                vote_weighted_receiver,
                 verified_tpu_vote_packets_sender,
                 verifier,
             )
@@ -153,6 +175,8 @@ impl Tpu {
             banking_stage,
             cluster_info_vote_listener,
             broadcast_stage,
+            transaction_weight_stage,
+            vote_transaction_weight_stage,
         }
     }
 
@@ -163,6 +187,8 @@ impl Tpu {
             self.vote_sigverify_stage.join(),
             self.cluster_info_vote_listener.join(),
             self.banking_stage.join(),
+            self.transaction_weight_stage.join(),
+            self.vote_transaction_weight_stage.join(),
         ];
         let broadcast_result = self.broadcast_stage.join();
         for result in results {

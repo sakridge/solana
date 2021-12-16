@@ -11,7 +11,7 @@ use {
     solana_measure::measure::Measure,
     solana_perf::packet::PacketBatch,
     solana_sdk::timing,
-    solana_streamer::streamer::{self, PacketBatchReceiver, StreamerError},
+    solana_streamer::streamer::{self, StreamerError},
     std::{
         collections::HashMap,
         sync::mpsc::{Receiver, RecvTimeoutError},
@@ -131,7 +131,7 @@ impl SigVerifier for DisabledSigVerifier {
 impl SigVerifyStage {
     #[allow(clippy::new_ret_no_self)]
     pub fn new<T: SigVerifier + 'static + Send + Clone>(
-        packet_receiver: Receiver<PacketBatch>,
+        packet_receiver: Receiver<Vec<PacketBatch>>,
         verified_sender: CrossbeamSender<Vec<PacketBatch>>,
         verifier: T,
     ) -> Self {
@@ -169,12 +169,12 @@ impl SigVerifyStage {
     }
 
     fn verifier<T: SigVerifier>(
-        recvr: &PacketBatchReceiver,
+        recvr: &Receiver<Vec<PacketBatch>>,
         sendr: &CrossbeamSender<Vec<PacketBatch>>,
         verifier: &T,
         stats: &mut SigVerifierStats,
     ) -> Result<()> {
-        let (mut batches, num_packets, recv_duration) = streamer::recv_packet_batches(recvr)?;
+        let (mut batches, num_packets, recv_duration) = streamer::recv_vec_packet_batches(recvr)?;
 
         let batches_len = batches.len();
         debug!(
@@ -216,7 +216,7 @@ impl SigVerifyStage {
     }
 
     fn verifier_service<T: SigVerifier + 'static + Send + Clone>(
-        packet_receiver: PacketBatchReceiver,
+        packet_receiver: Receiver<Vec<PacketBatch>>,
         verified_sender: CrossbeamSender<Vec<PacketBatch>>,
         verifier: &T,
     ) -> JoinHandle<()> {
@@ -252,7 +252,7 @@ impl SigVerifyStage {
     }
 
     fn verifier_services<T: SigVerifier + 'static + Send + Clone>(
-        packet_receiver: PacketBatchReceiver,
+        packet_receiver: Receiver<Vec<PacketBatch>>,
         verified_sender: CrossbeamSender<Vec<PacketBatch>>,
         verifier: T,
     ) -> JoinHandle<()> {

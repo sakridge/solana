@@ -6,15 +6,19 @@ use {
     solana_ledger::shred::{get_shred_slot_index_type, ShredFetchStats},
     solana_perf::{
         cuda_runtime::PinnedVec,
-        packet::{Packet, PacketBatchRecycler},
+        packet::{Packet, PacketBatch, PacketBatchRecycler},
         recycler::Recycler,
     },
     solana_runtime::bank_forks::BankForks,
     solana_sdk::clock::{Slot, DEFAULT_MS_PER_SLOT},
-    solana_streamer::streamer::{self, PacketBatchReceiver, PacketBatchSender},
+    solana_streamer::streamer::{self, PacketBatchReceiver},
     std::{
         net::UdpSocket,
-        sync::{atomic::AtomicBool, mpsc::channel, Arc, RwLock},
+        sync::{
+            atomic::AtomicBool,
+            mpsc::{channel, Sender},
+            Arc, RwLock,
+        },
         thread::{self, Builder, JoinHandle},
         time::Instant,
     },
@@ -64,7 +68,7 @@ impl ShredFetchStage {
     // updates packets received on a channel and sends them on another channel
     fn modify_packets<F>(
         recvr: PacketBatchReceiver,
-        sendr: PacketBatchSender,
+        sendr: Sender<Vec<PacketBatch>>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         name: &'static str,
         modify: F,
@@ -124,7 +128,7 @@ impl ShredFetchStage {
                 stats = ShredFetchStats::default();
                 last_stats = Instant::now();
             }
-            if sendr.send(packet_batch).is_err() {
+            if sendr.send(vec![packet_batch]).is_err() {
                 break;
             }
         }
@@ -133,7 +137,7 @@ impl ShredFetchStage {
     fn packet_modifier<F>(
         sockets: Vec<Arc<UdpSocket>>,
         exit: &Arc<AtomicBool>,
-        sender: PacketBatchSender,
+        sender: Sender<Vec<PacketBatch>>,
         recycler: Recycler<PinnedVec<Packet>>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         name: &'static str,
@@ -169,7 +173,7 @@ impl ShredFetchStage {
         sockets: Vec<Arc<UdpSocket>>,
         forward_sockets: Vec<Arc<UdpSocket>>,
         repair_socket: Arc<UdpSocket>,
-        sender: &PacketBatchSender,
+        sender: &Sender<Vec<PacketBatch>>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         exit: &Arc<AtomicBool>,
     ) -> Self {
