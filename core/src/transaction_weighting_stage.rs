@@ -76,3 +76,22 @@ impl TransactionWeightStage {
         self.thread_hdl.join()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_perf::packet::Packet;
+
+    #[test]
+    fn test_apply_weights() {
+        let packet = Packet::default();
+        let packets = PacketBatch::new(vec![packet]);
+        let ip_to_stake = HashMap::new();
+        let mut vec_packets_batch = vec![packets];
+        TransactionWeightStage::apply_weights(&mut vec_packets_batch, &ip_to_stake);
+        vec_packets_batch[0]
+            .packets
+            .iter()
+            .for_each(|packet| assert_eq!(packet.meta.weight, 0));
+    }
+}
