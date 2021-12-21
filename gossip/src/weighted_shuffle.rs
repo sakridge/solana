@@ -197,14 +197,14 @@ where
 /// Returns the highest index after computing a weighted shuffle.
 /// Saves doing any sorting for O(n) max calculation.
 // TODO: Remove in favor of rand::distributions::WeightedIndex.
-pub fn weighted_best(weights_and_indexes: &[(u64, usize)], seed: [u8; 32]) -> usize {
+pub fn weighted_best<T: Default + Copy>(weights_and_indexes: &[(u64, T)], seed: [u8; 32]) -> T {
     if weights_and_indexes.is_empty() {
-        return 0;
+        return T::default();
     }
     let mut rng = ChaChaRng::from_seed(seed);
     let total_weight: u64 = weights_and_indexes.iter().map(|x| x.0).sum();
     let mut lowest_weight = std::u128::MAX;
-    let mut best_index = 0;
+    let mut best_index = T::default();
     for v in weights_and_indexes {
         // This generates an "inverse" weight but it avoids floating point math
         let x = (total_weight / v.0)
