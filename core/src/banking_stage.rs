@@ -5,7 +5,7 @@ use {
     crate::{packet_deduper::PacketDeduper, qos_service::QosService},
     crossbeam_channel::{Receiver as CrossbeamReceiver, RecvTimeoutError},
     itertools::Itertools,
-    retain_mut::RetainMut,
+    rand::{thread_rng, Rng},
     solana_entry::entry::hash_transactions,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_ledger::blockstore_processor::TransactionStatusSender,
@@ -48,7 +48,7 @@ use {
     },
     std::{
         cmp,
-        collections::{HashMap, VecDeque},
+        collections::HashMap,
         env,
         mem::size_of,
         net::{SocketAddr, UdpSocket},
@@ -67,24 +67,22 @@ type PacketBatchAndOffsets = (PacketBatch, Vec<usize>, bool);
 
 pub struct UnprocessedPacketBatches {
     packets: HashMap<usize, PacketBatchAndOffsets>,
+    unprocessed: Vec<PacketLocation>,
     batch_limit: usize,
     current_id: usize,
 }
 
-struct PacketRefBatch<'a> {
-    packets: Vec<&'a Packet>,
-}
-
-impl<'a> PacketRefBatch<'a> {
-    fn len(&self) -> usize {
-        self.packets.len()
-    }
+#[derive(Clone)]
+struct PacketLocation {
+    id: usize,
+    offset: usize,
 }
 
 impl UnprocessedPacketBatches {
     fn with_capacity(batch_limit: usize) -> Self {
         Self {
             packets: HashMap::new(),
+            unprocessed: Vec::new(),
             batch_limit,
             current_id: 0,
         }
@@ -94,34 +92,79 @@ impl UnprocessedPacketBatches {
         self.packets.is_empty()
     }
 
-    fn add_batch(&mut self, batch: PacketBatchAndOffsets) {
+    fn get_packet<'a>(&'a self, location: &PacketLocation) -> Option<&'a Packet> {
+        self.packets
+            .get(&location.id)
+            .map(|p| &p.0.packets[location.offset])
+    }
+
+    fn add_batch(
+        &mut self,
+        batch: PacketBatchAndOffsets,
+        dropped_packet_batches_count: &mut usize,
+        dropped_packets_count: &mut usize,
+    ) {
         while self.packets.len() >= self.batch_limit {
-            //*dropped_packet_batches_count += 1;
-            if let Some(packets) = self.dequeue_worst_by_weight() {
-                //*dropped_packets_count += dropped_batch.1.len();
+            *dropped_packet_batches_count += 1;
+            if let Some(dropped_batch) = self.dequeue_worst_by_weight() {
+                *dropped_packets_count += dropped_batch.len();
             }
         }
         //*newly_buffered_packets_count += packet_indexes.len();
+        for offset in &batch.1 {
+            self.unprocessed.push(PacketLocation {
+                id: self.current_id,
+                offset: *offset,
+            });
+        }
         self.packets.insert(self.current_id, batch);
         self.current_id += 1;
     }
 
     fn clear(&mut self) {
         self.packets.clear();
+        self.unprocessed.clear();
+    }
+
+    fn clear_empty_batches(&mut self) {}
+
+    fn set_all_forwarded(&mut self) {
+        for (_id, batch) in self.packets.iter_mut() {
+            batch.2 = true;
+        }
     }
 
     fn len(&self) -> usize {
         self.packets.values().map(|packets| packets.1.len()).sum()
     }
 
-    fn dequeue_best_by_weight<'a>(&'a self) -> Option<PacketRefBatch<'a>> {
-        //solana_gossip::weighted_shuffle::weighted_best();
-        Some(PacketRefBatch { packets: vec![] })
-    }
-
-    fn dequeue_worst_by_weight<'a>(&'a mut self) -> Option<Vec<&'a Packet>> {
+    fn dequeue_best_by_weight(&mut self) -> Option<Vec<PacketLocation>> {
+        const NUM_PACKETS_TO_DEQUEUE: usize = 100;
+        if !self.unprocessed.is_empty() {
+            if self.unprocessed.len() > NUM_PACKETS_TO_DEQUEUE {
+                let mut ret = Vec::new();
+                while ret.len() < NUM_PACKETS_TO_DEQUEUE {
+                    //todo: solana_gossip::weighted_shuffle::weighted_best();
+                    let index = thread_rng().gen_range(0, self.unprocessed.len());
+                    ret.push(self.unprocessed.remove(index));
+                }
+                return Some(ret);
+            } else {
+                return Some(std::mem::take(&mut self.unprocessed));
+            }
+        }
         None
     }
+
+    fn dequeue_worst_by_weight(&self) -> Option<Vec<PacketLocation>> {
+        Some(vec![])
+    }
+
+    fn update_with_new_unprocessed(&mut self, new_unprocessed: Vec<PacketLocation>) {
+        self.unprocessed.extend(new_unprocessed);
+    }
+
+    fn update_with_new_processed(&mut self, new_processed: Vec<PacketLocation>) {}
 }
 
 /// Transaction forwarding
@@ -445,10 +488,11 @@ impl BankingStage {
     fn forward_buffered_packets(
         socket: &std::net::UdpSocket,
         tpu_forwards: &std::net::SocketAddr,
-        buffered_packet_batches: &UnprocessedPacketBatches,
+        buffered_packet_batches: &mut UnprocessedPacketBatches,
         data_budget: &DataBudget,
     ) -> std::io::Result<()> {
-        let packets = Self::filter_valid_packets_for_forwarding(buffered_packet_batches.iter());
+        //let packets = Self::filter_valid_packets_for_forwarding(buffered_packet_batches.iter());
+        //let packets_len = packets.len();
         const INTERVAL_MS: u64 = 100;
         const MAX_BYTES_PER_SECOND: usize = 10_000 * 1200;
         const MAX_BYTES_PER_INTERVAL: usize = MAX_BYTES_PER_SECOND * INTERVAL_MS as usize / 1000;
@@ -460,15 +504,22 @@ impl BankingStage {
             )
         });
 
-        let mut packet_vec = Vec::with_capacity(packets_len);
         let mut out_of_budget = false;
-        while let Some(packet_batch) = buffered_packet_batches.dequeue_best_by_weight() {
-            for p in packet_batch.packets.iter() {
-                if data_budget.take(p.meta.size) {
-                    packet_vec.push((&p.data[..p.meta.size], tpu_forwards));
-                } else {
-                    out_of_budget = true;
-                    break;
+        while let Some(packet_indexes) = buffered_packet_batches.dequeue_best_by_weight() {
+            for index in packet_indexes {
+                if let Some(p) = buffered_packet_batches.get_packet(&index) {
+                    let mut packet_vec = Vec::new();
+                    if data_budget.take(p.meta.size) {
+                        packet_vec.push((&p.data[..p.meta.size], tpu_forwards));
+                        if let Err(SendPktsError::IoError(ioerr, _num_failed)) =
+                            batch_send(socket, &packet_vec)
+                        {
+                            return Err(ioerr);
+                        }
+                    } else {
+                        out_of_budget = true;
+                        break;
+                    }
                 }
             }
             if out_of_budget {
@@ -482,8 +533,8 @@ impl BankingStage {
     // Returns whether the given `PacketBatch` has any more remaining unprocessed
     // transactions
     fn update_buffered_packets_with_new_unprocessed(
-        original_unprocessed_indexes: &mut Vec<usize>,
-        new_unprocessed_indexes: Vec<usize>,
+        original_unprocessed_indexes: &mut Vec<PacketLocation>,
+        new_unprocessed_indexes: Vec<PacketLocation>,
     ) -> bool {
         let has_more_unprocessed_transactions =
             Self::packet_has_more_unprocessed_transactions(&new_unprocessed_indexes);
@@ -512,26 +563,9 @@ impl BankingStage {
         let mut proc_start = Measure::start("consume_buffered_process");
         let mut reached_end_of_slot = None;
 
-        while let Some(packet_batch) = buffered_packet_batches.dequeue_best_by_weight() {
-            let mut processed_indexes = vec![];
-            //let (packet_batch, ref mut original_unprocessed_indexes, _forwarded) =
-            //    buffered_packet_batch_and_offsets;
-            if let Some((next_leader, bank)) = &reached_end_of_slot {
-                // We've hit the end of this slot, no need to perform more processing,
-                // just filter the remaining packets for the invalid (e.g. too old) ones
-                let new_unprocessed_indexes = Self::filter_unprocessed_packets(
-                    bank,
-                    &packet_batch,
-                    &original_unprocessed_indexes,
-                    my_pubkey,
-                    *next_leader,
-                    banking_stage_stats,
-                );
-                Self::update_buffered_packets_with_new_unprocessed(
-                    &mut original_unprocessed_indexes,
-                    new_unprocessed_indexes,
-                )
-            } else {
+        while let Some(packet_indexes) = buffered_packet_batches.dequeue_best_by_weight() {
+            let original_unprocessed_indexes = packet_indexes.clone();
+            if reached_end_of_slot.is_none() {
                 let bank_start = poh_recorder.lock().unwrap().bank_start();
                 if let Some(BankStart {
                     working_bank,
@@ -543,8 +577,8 @@ impl BankingStage {
                             &working_bank,
                             &bank_creation_time,
                             recorder,
-                            &packet_batch,
-                            original_unprocessed_indexes.to_owned(),
+                            &packet_indexes,
+                            buffered_packet_batches,
                             transaction_status_sender.clone(),
                             gossip_vote_sender,
                             banking_stage_stats,
@@ -566,15 +600,11 @@ impl BankingStage {
                     // Out of the buffered packets just retried, collect any still unprocessed
                     // transactions in this batch for forwarding
                     rebuffered_packet_count += new_unprocessed_indexes.len();
-                    let has_more_unprocessed_transactions =
-                        Self::update_buffered_packets_with_new_unprocessed(
-                            &mut original_unprocessed_indexes,
-                            new_unprocessed_indexes,
-                        );
+
+                    buffered_packet_batches.update_with_new_unprocessed(new_unprocessed_indexes);
                     if let Some(test_fn) = &test_fn {
                         test_fn();
                     }
-                    has_more_unprocessed_transactions
                 } else {
                     rebuffered_packet_count += original_unprocessed_indexes.len();
                     // `original_unprocessed_indexes` must have remaining packets to process
@@ -582,7 +612,6 @@ impl BankingStage {
                     assert!(Self::packet_has_more_unprocessed_transactions(
                         &original_unprocessed_indexes
                     ));
-                    true
                 }
             }
         }
@@ -753,10 +782,8 @@ impl BankingStage {
         };
         let _ = Self::forward_buffered_packets(socket, &addr, buffered_packet_batches, data_budget);
         if hold {
-            //buffered_packet_batches.retain(|(_, index, _)| !index.is_empty());
-            for (_, _, forwarded) in buffered_packet_batches.iter_mut() {
-                *forwarded = true;
-            }
+            buffered_packet_batches.clear_empty_batches();
+            buffered_packet_batches.set_all_forwarded();
         } else {
             buffered_packet_batches.clear();
         }
@@ -1146,13 +1173,13 @@ impl BankingStage {
     // transaction has result Ok() as the value
     fn filter_valid_transaction_indexes(
         valid_txs: &[TransactionCheckResult],
-        transaction_indexes: &[usize],
-    ) -> Vec<usize> {
+        transaction_indexes: &[PacketLocation],
+    ) -> Vec<PacketLocation> {
         valid_txs
             .iter()
             .enumerate()
             .filter_map(|(index, (x, _h))| if x.is_ok() { Some(index) } else { None })
-            .map(|x| transaction_indexes[x])
+            .map(|x| transaction_indexes[x].clone())
             .collect_vec()
     }
 
@@ -1171,15 +1198,15 @@ impl BankingStage {
     // with their packet indexes.
     #[allow(clippy::needless_collect)]
     fn transactions_from_packets(
-        packet_batch: &PacketRefBatch,
-        transaction_indexes: &[usize],
+        buffered_packet_batches: &mut UnprocessedPacketBatches,
+        transaction_indexes: &[PacketLocation],
         feature_set: &Arc<feature_set::FeatureSet>,
         votes_only: bool,
-    ) -> (Vec<SanitizedTransaction>, Vec<usize>) {
+    ) -> (Vec<SanitizedTransaction>, Vec<PacketLocation>) {
         transaction_indexes
             .iter()
             .filter_map(|tx_index| {
-                let p = &packet_batch.packets[*tx_index];
+                let p = &buffered_packet_batches.get_packet(&tx_index)?;
                 if votes_only && !p.meta.is_simple_vote_tx {
                     return None;
                 }
@@ -1195,7 +1222,7 @@ impl BankingStage {
                 )
                 .ok()?;
                 tx.verify_precompiles(feature_set).ok()?;
-                Some((tx, *tx_index))
+                Some((tx, tx_index.clone()))
             })
             .unzip()
     }
@@ -1208,9 +1235,9 @@ impl BankingStage {
     fn filter_pending_packets_from_pending_txs(
         bank: &Arc<Bank>,
         transactions: &[SanitizedTransaction],
-        transaction_to_packet_indexes: &[usize],
+        transaction_to_packet_indexes: &[PacketLocation],
         pending_indexes: &[usize],
-    ) -> Vec<usize> {
+    ) -> Vec<PacketLocation> {
         let filter =
             Self::prepare_filter_for_pending_transactions(transactions.len(), pending_indexes);
 
@@ -1244,17 +1271,17 @@ impl BankingStage {
         bank: &Arc<Bank>,
         bank_creation_time: &Instant,
         poh: &TransactionRecorder,
-        packet_batch: &PacketRefBatch,
-        packet_indexes: Vec<usize>,
+        packet_batch: &[PacketLocation],
+        buffered_packet_batches: &mut UnprocessedPacketBatches,
         transaction_status_sender: Option<TransactionStatusSender>,
         gossip_vote_sender: &ReplayVoteSender,
         banking_stage_stats: &BankingStageStats,
         qos_service: &QosService,
-    ) -> (usize, usize, Vec<usize>) {
+    ) -> (usize, usize, Vec<PacketLocation>) {
         let mut packet_conversion_time = Measure::start("packet_conversion");
         let (transactions, transaction_to_packet_indexes) = Self::transactions_from_packets(
+            buffered_packet_batches,
             packet_batch,
-            &packet_indexes,
             &bank.feature_set,
             bank.vote_only_bank(),
         );
@@ -1309,12 +1336,12 @@ impl BankingStage {
 
     fn filter_unprocessed_packets(
         bank: &Arc<Bank>,
-        packet_batch: &PacketRefBatch,
-        transaction_indexes: &[usize],
+        buffered_packet_batches: &mut UnprocessedPacketBatches,
+        transaction_indexes: &[PacketLocation],
         my_pubkey: &Pubkey,
         next_leader: Option<Pubkey>,
         banking_stage_stats: &BankingStageStats,
-    ) -> Vec<usize> {
+    ) -> Vec<PacketLocation> {
         // Check if we are the next leader. If so, let's not filter the packets
         // as we'll filter it again while processing the packets.
         // Filtering helps if we were going to forward the packets to some other node
@@ -1327,7 +1354,7 @@ impl BankingStage {
         let mut unprocessed_packet_conversion_time =
             Measure::start("unprocessed_packet_conversion");
         let (transactions, transaction_to_packet_indexes) = Self::transactions_from_packets(
-            packet_batch,
+            buffered_packet_batches,
             transaction_indexes,
             &bank.feature_set,
             bank.vote_only_bank(),
@@ -1465,12 +1492,16 @@ impl BankingStage {
         banking_stage_stats: &BankingStageStats,
     ) {
         packet_deduper.dedupe_packets(&packet_batch, &mut packet_indexes, banking_stage_stats);
-        if Self::packet_has_more_unprocessed_transactions(&packet_indexes) {
-            unprocessed_packet_batches.add_batch((packet_batch, packet_indexes, false));
+        if !packet_indexes.is_empty() {
+            unprocessed_packet_batches.add_batch(
+                (packet_batch, packet_indexes, false),
+                dropped_packet_batches_count,
+                dropped_packets_count,
+            );
         }
     }
 
-    fn packet_has_more_unprocessed_transactions(packet_indexes: &[usize]) -> bool {
+    fn packet_has_more_unprocessed_transactions(packet_indexes: &[PacketLocation]) -> bool {
         !packet_indexes.is_empty()
     }
 
