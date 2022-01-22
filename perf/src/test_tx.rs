@@ -26,6 +26,35 @@ pub fn test_invalid_tx() -> Transaction {
     tx
 }
 
+pub fn test_tx_with_num_sigs(num_sigs: usize) -> Transaction {
+    use solana_sdk::{
+        instruction::{AccountMeta, Instruction},
+        message::Message,
+        pubkey::Pubkey,
+    };
+    let keypairs: Vec<_> = (0..num_sigs).into_iter().map(|_| Keypair::new()).collect();
+    let num_readonly_signed_accounts = num_sigs as u8;
+    let pubkeys: Vec<_> = keypairs.iter().map(|kp| kp.pubkey()).collect();
+    let metas: Vec<_> = pubkeys
+        .iter()
+        .map(|pk| AccountMeta::new(*pk, true))
+        .collect();
+    let indexes = (0..num_sigs).into_iter().map(|x| x as u8).collect();
+    let instruction = CompiledInstruction::new(0, &(), indexes);
+    let message = Message::new_with_compiled_instructions(
+        num_sigs as u8,
+        num_readonly_signed_accounts,
+        0,
+        pubkeys,
+        Hash::default(),
+        vec![instruction],
+    );
+    let mut transaction = Transaction::new_unsigned(message);
+    let keypair_refs: Vec<_> = keypairs.iter().collect();
+    transaction.sign(&keypair_refs, Hash::default());
+    transaction
+}
+
 pub fn test_multisig_tx() -> Transaction {
     let keypair0 = Keypair::new();
     let keypair1 = Keypair::new();

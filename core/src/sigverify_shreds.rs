@@ -41,7 +41,7 @@ impl ShredSigVerifier {
 }
 
 impl SigVerifier for ShredSigVerifier {
-    fn verify_batches(&self, mut batches: Vec<PacketBatch>) -> Vec<PacketBatch> {
+    fn verify_batches(&self, mut batches: Vec<PacketBatch>, _valid_packets: usize) -> Vec<PacketBatch> {
         let r_bank = self.bank_forks.read().unwrap().working_bank();
         let slots: HashSet<u64> = Self::read_slots(&batches);
         let mut leader_slots: HashMap<u64, [u8; 32]> = slots

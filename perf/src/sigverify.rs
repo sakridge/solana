@@ -385,41 +385,50 @@ pub fn generate_offsets(
     let mut msg_sizes: PinnedVec<_> = recycler.allocate("msg_size_offsets");
     msg_sizes.set_pinnable();
     let mut current_offset: usize = 0;
-    let mut v_sig_lens = Vec::new();
-    batches.iter_mut().for_each(|batch| {
-        let mut sig_lens = Vec::new();
-        batch.packets.iter_mut().for_each(|packet| {
-            let packet_offsets = get_packet_offsets(packet, current_offset, reject_non_vote);
+    let offsets = batches
+        .iter_mut()
+        .map(|batch| {
+            batch
+                .packets
+                .iter_mut()
+                .filter_map(|packet| {
+                    if !packet.meta.discard() {
+                        let packet_offsets =
+                            get_packet_offsets(packet, current_offset, reject_non_vote);
 
-            sig_lens.push(packet_offsets.sig_len);
+                        trace!("pubkey_offset: {}", packet_offsets.pubkey_start);
 
-            trace!("pubkey_offset: {}", packet_offsets.pubkey_start);
+                        let mut pubkey_offset = packet_offsets.pubkey_start;
+                        let mut sig_offset = packet_offsets.sig_start;
+                        let msg_size = current_offset.saturating_add(packet.meta.size) as u32;
+                        for _ in 0..packet_offsets.sig_len {
+                            signature_offsets.push(sig_offset);
+                            sig_offset = sig_offset.saturating_add(size_of::<Signature>() as u32);
 
-            let mut pubkey_offset = packet_offsets.pubkey_start;
-            let mut sig_offset = packet_offsets.sig_start;
-            let msg_size = current_offset.saturating_add(packet.meta.size) as u32;
-            for _ in 0..packet_offsets.sig_len {
-                signature_offsets.push(sig_offset);
-                sig_offset = sig_offset.saturating_add(size_of::<Signature>() as u32);
+                            pubkey_offsets.push(pubkey_offset);
+                            pubkey_offset =
+                                pubkey_offset.saturating_add(size_of::<Pubkey>() as u32);
 
-                pubkey_offsets.push(pubkey_offset);
-                pubkey_offset = pubkey_offset.saturating_add(size_of::<Pubkey>() as u32);
+                            msg_start_offsets.push(packet_offsets.msg_start);
 
-                msg_start_offsets.push(packet_offsets.msg_start);
-
-                let msg_size = msg_size.saturating_sub(packet_offsets.msg_start);
-                msg_sizes.push(msg_size);
-            }
-            current_offset = current_offset.saturating_add(size_of::<Packet>());
-        });
-        v_sig_lens.push(sig_lens);
-    });
+                            let msg_size = msg_size.saturating_sub(packet_offsets.msg_start);
+                            msg_sizes.push(msg_size);
+                        }
+                        current_offset = current_offset.saturating_add(size_of::<Packet>());
+                        Some(packet_offsets.sig_len)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .collect();
     (
         signature_offsets,
         pubkey_offsets,
         msg_start_offsets,
         msg_sizes,
-        v_sig_lens,
+        offsets,
     )
 }
 
@@ -492,9 +501,8 @@ impl Deduper {
     }
 }
 
-pub fn ed25519_verify_cpu(batches: &mut [PacketBatch], reject_non_vote: bool) {
+pub fn ed25519_verify_cpu(batches: &mut [PacketBatch], reject_non_vote: bool, packet_count: usize) {
     use rayon::prelude::*;
-    let packet_count = count_packets_in_batches(batches);
     debug!("CPU ECDSA for {}", packet_count);
     PAR_THREAD_POOL.install(|| {
         batches.into_par_iter().for_each(|batch| {
@@ -584,29 +592,29 @@ pub fn ed25519_verify(
     recycler: &Recycler<TxOffset>,
     recycler_out: &Recycler<PinnedVec<u8>>,
     reject_non_vote: bool,
+    valid_packet_count: usize,
 ) {
     let api = perf_libs::api();
     if api.is_none() {
-        return ed25519_verify_cpu(batches, reject_non_vote);
+        return ed25519_verify_cpu(batches, reject_non_vote, valid_packet_count);
     }
     let api = api.unwrap();
 
     use crate::packet::PACKET_DATA_SIZE;
-    let packet_count = count_packets_in_batches(batches);
 
     // micro-benchmarks show GPU time for smallest batch around 15-20ms
     // and CPU speed for 64-128 sigverifies around 10-20ms. 64 is a nice
     // power-of-two number around that accounting for the fact that the CPU
     // may be busy doing other things while being a real validator
     // TODO: dynamically adjust this crossover
-    if packet_count < 64 {
-        return ed25519_verify_cpu(batches, reject_non_vote);
+    if valid_packet_count < 64 {
+        return ed25519_verify_cpu(batches, reject_non_vote, valid_packet_count);
     }
 
     let (signature_offsets, pubkey_offsets, msg_start_offsets, msg_sizes, sig_lens) =
         generate_offsets(batches, recycler, reject_non_vote);
 
-    debug!("CUDA ECDSA for {}", packet_count);
+    debug!("CUDA ECDSA for {}", valid_packet_count);
     debug!("allocating out..");
     let mut out = recycler_out.allocate("out_buffer");
     out.set_pinnable();
@@ -651,7 +659,7 @@ pub fn ed25519_verify(
     trace!("done verify");
     copy_return_values(&sig_lens, &out, &mut rvs);
     mark_disabled(batches, &rvs);
-    inc_new_counter_debug!("ed25519_verify_gpu", packet_count);
+    inc_new_counter_debug!("ed25519_verify_gpu", valid_packet_count);
 }
 
 #[cfg(test)]
@@ -1052,7 +1060,8 @@ mod tests {
     fn ed25519_verify(batches: &mut [PacketBatch]) {
         let recycler = Recycler::default();
         let recycler_out = Recycler::default();
-        sigverify::ed25519_verify(batches, &recycler, &recycler_out, false);
+        let packet_count = sigverify::count_packets_in_batches(&batches);
+        sigverify::ed25519_verify(batches, &recycler, &recycler_out, false, packet_count);
     }
 
     #[test]
@@ -1150,8 +1159,9 @@ mod tests {
             // verify from GPU verification pipeline (when GPU verification is enabled) are
             // equivalent to the CPU verification pipeline.
             let mut batches_cpu = batches.clone();
-            sigverify::ed25519_verify(&mut batches, &recycler, &recycler_out, false);
-            ed25519_verify_cpu(&mut batches_cpu, false);
+            let packet_count = sigverify::count_packets_in_batches(&batches);
+            sigverify::ed25519_verify(&mut batches, &recycler, &recycler_out, false, packet_count);
+            ed25519_verify_cpu(&mut batches_cpu, false, packet_count);
 
             // check result
             batches
