@@ -1321,6 +1321,7 @@ fn new_banks_from_ledger(
         mut leader_schedule_cache,
         last_full_snapshot_slot,
         starting_snapshot_hashes,
+        _time,
     ) = bank_forks_utils::load(
         &genesis_config,
         &blockstore,

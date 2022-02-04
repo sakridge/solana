@@ -92,7 +92,7 @@ impl BlockCostCapacityMeter {
     }
 }
 
-pub type BlockstoreProcessorInner = (BankForks, LeaderScheduleCache, Option<Slot>);
+pub type BlockstoreProcessorInner = (BankForks, LeaderScheduleCache, Option<Slot>, usize);
 
 pub type BlockstoreProcessorResult =
     result::Result<BlockstoreProcessorInner, BlockstoreProcessorError>;
@@ -731,7 +731,7 @@ fn do_process_blockstore_from_root(
     );
     assert!(bank_forks.active_banks().is_empty());
 
-    Ok((bank_forks, leader_schedule_cache, last_full_snapshot_slot))
+    Ok((bank_forks, leader_schedule_cache, last_full_snapshot_slot, processing_time.as_millis() as usize))
 }
 
 /// Verify that a segment of entries has the correct number of ticks and hashes

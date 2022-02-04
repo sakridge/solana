@@ -56,6 +56,7 @@ members = [
     "programs/vote",
     "rbpf-cli",
     "remote-wallet",
+    "replay-bench",
     "rpc",
     "runtime",
     "runtime/store-tool",

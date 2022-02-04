@@ -28,6 +28,7 @@ pub type LoadResult = result::Result<
         LeaderScheduleCache,
         Option<Slot>,
         Option<StartingSnapshotHashes>,
+        usize,
     ),
     BlockstoreProcessorError,
 >;
@@ -37,12 +38,13 @@ fn to_loadresult(
     starting_snapshot_hashes: Option<StartingSnapshotHashes>,
 ) -> LoadResult {
     bpr.map(
-        |(bank_forks, leader_schedule_cache, last_full_snapshot_slot)| {
+        |(bank_forks, leader_schedule_cache, last_full_snapshot_slot, time_ms)| {
             (
                 bank_forks,
                 leader_schedule_cache,
                 last_full_snapshot_slot,
                 starting_snapshot_hashes,
+                time_ms,
             )
         },
     )

@@ -5733,6 +5733,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-replay-bench"
+version = "1.10.0"
+dependencies = [
+ "clap 2.33.3",
+ "crossbeam-channel",
+ "log 0.4.14",
+ "rand 0.7.3",
+ "rayon",
+ "solana-entry",
+ "solana-ledger",
+ "solana-logger 1.10.0",
+ "solana-measure",
+ "solana-sdk",
+ "solana-version",
+]
+
+[[package]]
 name = "solana-replica-lib"
 version = "1.10.0"
 dependencies = [
