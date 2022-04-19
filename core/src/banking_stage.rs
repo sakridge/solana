@@ -728,7 +728,7 @@ impl BankingStage {
 
         proc_start.stop();
 
-        debug!(
+        info!(
             "@{:?} done processing buffered batches: {} time: {:?}ms tx count: {} tx/s: {}",
             timestamp(),
             buffered_packet_batches_len,
@@ -1331,7 +1331,7 @@ impl BankingStage {
 
         drop(freeze_lock);
 
-        debug!(
+        info!(
             "bank: {} process_and_record_locked: {}us record: {}us commit: {}us txs_len: {}",
             bank.slot(),
             load_execute_time.as_us(),
@@ -1431,7 +1431,7 @@ impl BankingStage {
         // reports qos service stats for this batch
         qos_service.report_metrics(bank.clone());
 
-        debug!(
+        info!(
             "bank: {} lock: {}us unlock: {}us txs_len: {}",
             bank.slot(),
             lock_time.as_us(),
@@ -1953,7 +1953,7 @@ impl BankingStage {
 
         let packet_batches_len = packet_batches.len();
         let packet_count: usize = packet_batches.iter().map(|x| x.packets.len()).sum();
-        debug!(
+        info!(
             "@{:?} process start stalled for: {:?}ms txs: {} id: {}",
             timestamp(),
             duration_as_ms(&recv_start.elapsed()),
@@ -1991,7 +1991,7 @@ impl BankingStage {
         }
         proc_start.stop();
 
-        debug!(
+        info!(
             "@{:?} done processing transaction batches: {} time: {:?}ms total count: {} id: {}",
             timestamp(),
             packet_batches_len,
