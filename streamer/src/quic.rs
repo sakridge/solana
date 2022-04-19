@@ -152,6 +152,7 @@ fn handle_chunk(
     maybe_batch: &mut Option<PacketBatch>,
     remote_addr: &SocketAddr,
     packet_sender: &Sender<PacketBatch>,
+    stats: &StreamStats,
 ) -> bool {
     match chunk {
         Ok(maybe_chunk) => {
@@ -189,6 +190,7 @@ fn handle_chunk(
                     if let Err(e) = packet_sender.send(batch) {
                         info!("send error: {}", e);
                     } else {
+                        stats.sent_packets.fetch_add(1, Ordering::Relaxed);
                         trace!("sent {} byte packet", len);
                     }
                 }
@@ -309,6 +311,7 @@ struct StreamStats {
     num_evictions: AtomicUsize,
     connection_add_failed: AtomicUsize,
     connection_setup_timeout: AtomicUsize,
+    sent_packets: AtomicUsize,
 }
 
 impl StreamStats {
@@ -333,6 +336,11 @@ impl StreamStats {
             (
                 "new_streams",
                 self.total_new_streams.swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "sent_packets",
+                self.sent_packets.swap(0, Ordering::Relaxed),
                 i64
             ),
             (
@@ -383,6 +391,7 @@ fn handle_connection(
                                 &mut maybe_batch,
                                 &remote_addr,
                                 &packet_sender,
+                                &stats,
                             ) {
                                 last_update.store(timing::timestamp(), Ordering::Relaxed);
                                 break;
