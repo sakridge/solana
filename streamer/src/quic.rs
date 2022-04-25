@@ -462,17 +462,19 @@ fn handle_connection(
                         }
                     }
                     Err(e) => {
-                        debug!("stream error: {:?}", e);
+                        info!("stream error: {:?}", e);
                         stats.total_streams.fetch_sub(1, Ordering::Relaxed);
                         break;
                     }
                 },
                 None => {
+                    info!("exiting stream?");
                     stats.total_streams.fetch_sub(1, Ordering::Relaxed);
                     break;
                 }
             }
         }
+        info!("removing connection");
         connection_table
             .lock()
             .unwrap()
@@ -534,6 +536,7 @@ pub fn spawn_server(
                         } = new_connection;
 
                         let remote_addr = connection.remote_address();
+                        info!("connection from: {}", remote_addr);
 
                         let mut connection_table_l =
                             if staked_nodes.read().unwrap().contains_key(&remote_addr.ip()) {

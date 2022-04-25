@@ -171,7 +171,7 @@ struct BankSendVotesStats {
 
 impl BankSendVotesStats {
     fn report_metrics(&self, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "cluster_info_vote_listener-bank-send-vote-stats",
             ("slot", slot, i64),
             ("num_votes_sent", self.num_votes_sent, i64),

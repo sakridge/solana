@@ -57,7 +57,7 @@ impl OptimisticConfirmationVerifier {
             return;
         }
 
-        datapoint_info!(
+        datapoint_debug!(
             "optimistic_slot_elapsed",
             (
                 "average_elapsed_ms",
@@ -70,7 +70,7 @@ impl OptimisticConfirmationVerifier {
         // so ignore those slots
         for (new_optimistic_slot, hash) in new_optimistic_slots {
             if new_optimistic_slot > self.snapshot_start_slot {
-                datapoint_info!("optimistic_slot", ("slot", new_optimistic_slot, i64),);
+                datapoint_debug!("optimistic_slot", ("slot", new_optimistic_slot, i64),);
                 self.unchecked_slots.insert((new_optimistic_slot, hash));
             }
         }

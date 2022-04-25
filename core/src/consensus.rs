@@ -301,7 +301,7 @@ impl Tower {
                     vote_state.nth_recent_vote(0).map(|v| v.slot).unwrap_or(0) as i64
                 );
                 debug!("observed root {}", vote_state.root_slot.unwrap_or(0) as i64);
-                datapoint_info!(
+                datapoint_debug!(
                     "tower-observed",
                     (
                         "slot",
