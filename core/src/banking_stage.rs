@@ -76,7 +76,7 @@ pub const FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET: u64 = 2;
 pub const HOLD_TRANSACTIONS_SLOT_OFFSET: u64 = 20;
 
 // Fixed thread size seems to be fastest on GCP setup
-pub const NUM_THREADS: u32 = 4;
+pub const NUM_THREADS: u32 = 6;
 
 const TOTAL_BUFFERED_PACKETS: usize = 500_000;
 
@@ -389,6 +389,7 @@ impl BankingStage {
         cluster_info: &Arc<ClusterInfo>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
         verified_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
+        quic_verified_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
         tpu_verified_vote_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
         verified_vote_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
         transaction_status_sender: Option<TransactionStatusSender>,
@@ -399,6 +400,7 @@ impl BankingStage {
             cluster_info,
             poh_recorder,
             verified_receiver,
+            quic_verified_receiver,
             tpu_verified_vote_receiver,
             verified_vote_receiver,
             Self::num_threads(),
@@ -413,6 +415,7 @@ impl BankingStage {
         cluster_info: &Arc<ClusterInfo>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
         verified_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
+        quic_verified_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
         tpu_verified_vote_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
         verified_vote_receiver: CrossbeamReceiver<Vec<PacketBatch>>,
         num_threads: u32,
@@ -439,6 +442,14 @@ impl BankingStage {
                     1 => (
                         tpu_verified_vote_receiver.clone(),
                         ForwardOption::ForwardTpuVote,
+                    ),
+                    2 => (
+                        quic_verified_receiver.clone(),
+                        ForwardOption::ForwardTransaction,
+                    ),
+                    3 => (
+                        quic_verified_receiver.clone(),
+                        ForwardOption::ForwardTransaction,
                     ),
                     _ => (verified_receiver.clone(), ForwardOption::ForwardTransaction),
                 };

@@ -54,6 +54,7 @@ pub struct TpuSockets {
 pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
+    quic_sigverify_stage: SigVerifyStage,
     vote_sigverify_stage: SigVerifyStage,
     banking_stage: BankingStage,
     cluster_info_vote_listener: ClusterInfoVoteListener,
@@ -131,6 +132,7 @@ impl Tpu {
         );
 
         let (verified_sender, verified_receiver) = unbounded();
+        let (quic_verified_sender, quic_verified_receiver) = unbounded();
 
         let staked_nodes = Arc::new(RwLock::new(HashMap::new()));
         let staked_nodes_updater_service = StakedNodesUpdaterService::new(
@@ -139,11 +141,12 @@ impl Tpu {
             bank_forks.clone(),
             staked_nodes.clone(),
         );
+        let (quic_packet_sender, quic_packet_receiver) = unbounded();
         let tpu_quic_t = spawn_server(
             transactions_quic_sockets,
             keypair,
             cluster_info.my_contact_info().tpu.ip(),
-            packet_sender,
+            quic_packet_sender,
             exit.clone(),
             MAX_QUIC_CONNECTIONS_PER_IP,
             staked_nodes,
@@ -159,6 +162,16 @@ impl Tpu {
                 verified_sender,
                 verifier,
                 "tpu-verifier",
+            )
+        };
+
+        let quic_sigverify_stage = {
+            let verifier = TransactionSigVerifier::default();
+            SigVerifyStage::new(
+                quic_packet_receiver,
+                quic_verified_sender,
+                verifier,
+                "quic-verifier",
             )
         };
 
@@ -196,6 +209,7 @@ impl Tpu {
             cluster_info,
             poh_recorder,
             verified_receiver,
+            quic_verified_receiver,
             verified_tpu_vote_packets_receiver,
             verified_gossip_vote_packets_receiver,
             transaction_status_sender,
@@ -217,6 +231,7 @@ impl Tpu {
         Self {
             fetch_stage,
             sigverify_stage,
+            quic_sigverify_stage,
             vote_sigverify_stage,
             banking_stage,
             cluster_info_vote_listener,
@@ -232,6 +247,7 @@ impl Tpu {
         let results = vec![
             self.fetch_stage.join(),
             self.sigverify_stage.join(),
+            self.quic_sigverify_stage.join(),
             self.vote_sigverify_stage.join(),
             self.cluster_info_vote_listener.join(),
             self.banking_stage.join(),

@@ -168,6 +168,7 @@ fn main() {
     } = create_genesis_config(mint_total);
 
     let (verified_sender, verified_receiver) = unbounded();
+    let (quic_verified_sender, quic_verified_receiver) = unbounded();
     let (vote_sender, vote_receiver) = unbounded();
     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
     let (replay_vote_sender, _replay_vote_receiver) = unbounded();
@@ -241,6 +242,7 @@ fn main() {
             &cluster_info,
             &poh_recorder,
             verified_receiver,
+            quic_verified_receiver,
             tpu_vote_receiver,
             vote_receiver,
             None,
