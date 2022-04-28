@@ -6,6 +6,7 @@ use {
         cli::{self, ExternalClientType},
         keypairs::get_keypairs,
     },
+    clap::value_t,
     solana_client::{
         connection_cache,
         rpc_client::RpcClient,
@@ -121,13 +122,17 @@ fn main() {
             } else if let Some(target_node) = target_node {
                 info!("Searching for target_node: {:?}", target_node);
                 let mut target_client = None;
-                for node in nodes {
+                /*for node in nodes {
                     if node.id == *target_node {
                         target_client =
                             Some(Arc::new(get_client(&[node], &SocketAddrSpace::Unspecified)));
                         break;
                     }
-                }
+                }*/
+                let rpc = value_t!(matches, "rpc_addr", String).unwrap().parse().unwrap();
+                let tpu = value_t!(matches, "tpu_addr", String).unwrap().parse().unwrap();
+
+                target_client = Some(Arc::new(solana_client::thin_client::create_client((rpc, tpu))));
                 target_client.unwrap_or_else(|| {
                     eprintln!("Target node {} not found", target_node);
                     exit(1);

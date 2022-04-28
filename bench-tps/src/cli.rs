@@ -123,6 +123,20 @@ pub fn build_args<'a, 'b>(version: &'b str) -> App<'a, 'b> {
                 .help("WebSocket URL for the solana cluster"),
         )
         .arg(
+            Arg::with_name("rpc_addr")
+                .long("rpc-addr")
+                .value_name("HOST:PORT")
+                .takes_value(true)
+                .help("Rendezvous with the cluster at this entry point; defaults to 127.0.0.1:8001"),
+        )
+        .arg(
+            Arg::with_name("tpu_addr")
+                .long("tpu-addr")
+                .value_name("HOST:PORT")
+                .takes_value(true)
+                .help("Rendezvous with the cluster at this entry point; defaults to 127.0.0.1:8001"),
+        )
+        .arg(
             Arg::with_name("entrypoint")
                 .short("n")
                 .long("entrypoint")

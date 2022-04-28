@@ -47,7 +47,7 @@ impl SlotStats {
 
     fn report(&self, slot: Slot) {
         let min_fec_set_count = self.get_min_index_count();
-        datapoint_info!(
+        datapoint_debug!(
             "slot_stats_tracking_complete",
             ("slot", slot, i64),
             ("last_index", self.last_index, i64),

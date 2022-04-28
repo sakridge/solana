@@ -520,7 +520,7 @@ pub fn spawn_server(
                 )
                 .await;
 
-                if last_datapoint.elapsed().as_secs() >= 5 {
+                if last_datapoint.elapsed().as_millis() >= 1000 {
                     stats.report();
                     last_datapoint = Instant::now();
                 }

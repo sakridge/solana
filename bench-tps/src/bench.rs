@@ -844,8 +844,9 @@ pub fn fund_keypairs<T: 'static + BenchTpsClient + Send + Sync>(
     extra: u64,
     lamports_per_account: u64,
 ) -> Result<()> {
-    let rent = client.get_minimum_balance_for_rent_exemption(0)?;
-    info!("Get lamports...");
+    let rent = client.get_minimum_balance_for_rent_exemption(0);
+    info!("Get lamports... {:?}", rent);
+    let rent = rent.unwrap_or(10_000);
 
     // Sample the first keypair, to prevent lamport loss on repeated solana-bench-tps executions
     let first_key = keypairs[0].pubkey();
