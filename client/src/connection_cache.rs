@@ -5,7 +5,9 @@ use {
         udp_client::UdpTpuConnection,
     },
     lazy_static::lazy_static,
+    log::*,
     lru::LruCache,
+    solana_measure::measure::Measure,
     solana_net_utils::VALIDATOR_PORT_RANGE,
     solana_sdk::{
         timing::AtomicInterval, transaction::VersionedTransaction, transport::TransportError,
@@ -151,7 +153,9 @@ pub fn set_use_quic(use_quic: bool) {
 // TODO: see https://github.com/solana-labs/solana/issues/23661
 // remove lazy_static and optimize and refactor this
 fn get_connection(addr: &SocketAddr) -> (Connection, Arc<ConnectionCacheStats>) {
+    let mut lock_time = Measure::start("lock");
     let mut map = (*CONNECTION_MAP).lock().unwrap();
+    lock_time.stop();
 
     if map
         .last_stats
@@ -160,13 +164,18 @@ fn get_connection(addr: &SocketAddr) -> (Connection, Arc<ConnectionCacheStats>) 
         map.stats.report();
     }
 
+    let mut existing_us = 0;
+    let mut new_time = 0;
     let (connection, hit, maybe_stats) = match map.map.get(addr) {
         Some(connection) => {
+            let mut existing = Measure::start("existing");
             let mut stats = None;
             // update connection stats
             if let Connection::Quic(conn) = connection {
                 stats = conn.stats().map(|s| (conn.base_stats(), s));
             }
+            existing.stop();
+            existing_us += existing.as_us();
             (connection.clone(), true, stats)
         }
         None => {
@@ -175,6 +184,7 @@ fn get_connection(addr: &SocketAddr) -> (Connection, Arc<ConnectionCacheStats>) 
                 VALIDATOR_PORT_RANGE,
             )
             .unwrap();
+            let mut new = Measure::start("new_connection");
             let connection = if map.use_quic {
                 Connection::Quic(Arc::new(QuicTpuConnection::new(send_socket, *addr)))
             } else {
@@ -182,9 +192,16 @@ fn get_connection(addr: &SocketAddr) -> (Connection, Arc<ConnectionCacheStats>) 
             };
 
             map.map.put(*addr, connection.clone());
+            new.stop();
+            new_time += new.as_us();
+
             (connection, false, None)
         }
     };
+    info!(
+        "lock: {} new: {} existing: {}us",
+        lock_time, new_time, existing_us
+    );
 
     if let Some((connection_stats, new_stats)) = maybe_stats {
         map.stats.total_client_stats.congestion_events.update_stat(
@@ -232,12 +249,23 @@ pub fn send_wire_transaction_batch(
     packets: &[&[u8]],
     addr: &SocketAddr,
 ) -> Result<(), TransportError> {
+    let mut c_time = Measure::start("get_connection");
     let (conn, stats) = get_connection(addr);
+    c_time.stop();
     let client_stats = ClientStats::default();
+    let mut s_time = Measure::start("send_batch");
     let r = match conn {
         Connection::Udp(conn) => conn.send_wire_transaction_batch(packets, &client_stats),
         Connection::Quic(conn) => conn.send_wire_transaction_batch(packets, &client_stats),
     };
+    s_time.stop();
+    info!(
+        "quic batch send {} packets to {} {} {}",
+        packets.len(),
+        addr,
+        c_time,
+        s_time
+    );
     stats.add_client_stats(&client_stats, packets.len(), r.is_ok());
     r
 }
@@ -260,7 +288,9 @@ pub fn send_wire_transaction_batch_async(
     packets: Vec<Vec<u8>>,
     addr: &SocketAddr,
 ) -> Result<(), TransportError> {
+    info!("start sending batch {}", packets.len());
     let (conn, stats) = get_connection(addr);
+    info!("got connection {}", packets.len());
     let client_stats = Arc::new(ClientStats::default());
     let len = packets.len();
     let r = match conn {

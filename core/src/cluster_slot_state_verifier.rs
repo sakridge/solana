@@ -752,7 +752,7 @@ pub(crate) fn check_slot_agrees_with_cluster(
     ancestor_hashes_replay_update_sender: &AncestorHashesReplayUpdateSender,
     slot_state_update: SlotStateUpdate,
 ) {
-    info!(
+    debug!(
         "check_slot_agrees_with_cluster()
         slot: {},
         root: {},

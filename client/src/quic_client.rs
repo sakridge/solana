@@ -129,8 +129,10 @@ impl TpuConnection for QuicTpuConnection {
         let _ = RUNTIME.spawn(async move {
             let send_buffer = client.send_buffer(wire_transaction, &stats);
             if let Err(e) = send_buffer.await {
-                warn!("Failed to send transaction async to {:?}", e);
+                warn!("Failed to send transaction async to {:?} addr: {:?}", e, self.tpu_addr());
                 datapoint_warn!("send-wire-async", ("failure", 1, i64),);
+            } else {
+                info!("Sent transaction to {:?}", self.tpu_addr());
             }
         });
         Ok(())
@@ -141,16 +143,20 @@ impl TpuConnection for QuicTpuConnection {
         buffers: Vec<Vec<u8>>,
         stats: Arc<ClientStats>,
     ) -> TransportResult<()> {
+        info!("quic async sending batch {}", buffers.len());
         let _guard = RUNTIME.enter();
         let client = self.client.clone();
         //drop and detach the task
+        info!("quic async spawning batch {}", buffers.len());
+        let buffers_len = buffers.len();
         let _ = RUNTIME.spawn(async move {
             let send_batch = client.send_batch(&buffers, &stats);
             if let Err(e) = send_batch.await {
-                warn!("Failed to send transaction batch async to {:?}", e);
+                warn!("Failed to send transaction batch async to {:?} {:?}", e);
                 datapoint_warn!("send-wire-batch-async", ("failure", 1, i64),);
             }
         });
+        info!("quic async done spawn batch {}", buffers_len);
         Ok(())
     }
 }

@@ -124,7 +124,7 @@ impl ReceiveWindowStats {
         if elapsed.unwrap_or(Duration::MAX) < SUBMIT_CADENCE {
             return;
         }
-        datapoint_info!(
+        datapoint_debug!(
             "receive_window_stats",
             ("num_packets", self.num_packets, i64),
             ("num_shreds", self.num_shreds, i64),
@@ -132,7 +132,7 @@ impl ReceiveWindowStats {
             ("elapsed_micros", self.elapsed.as_micros(), i64),
         );
         for (slot, num_shreds) in &self.slots {
-            datapoint_info!(
+            datapoint_debug!(
                 "receive_window_num_slot_shreds",
                 ("slot", *slot, i64),
                 ("num_shreds", *num_shreds, i64)
@@ -145,7 +145,7 @@ impl ReceiveWindowStats {
             addrs.truncate(MAX_NUM_ADDRS);
         }
         addrs.sort_unstable_by_key(reverse_count);
-        info!(
+        debug!(
             "num addresses: {}, top packets by source: {:?}",
             self.addrs.len(),
             addrs

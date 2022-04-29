@@ -3,7 +3,7 @@
 
 use {
     rand::{thread_rng, Rng},
-    solana_client::connection_cache::send_wire_transaction,
+    solana_client::connection_cache::{send_wire_transaction_async, send_wire_transaction},
     solana_gossip::cluster_info::ClusterInfo,
     solana_poh::poh_recorder::PohRecorder,
     std::{
@@ -48,11 +48,16 @@ impl WarmQuicCacheService {
                             if let Some(addr) = cluster_info
                                 .lookup_contact_info(&leader_pubkey, |leader| leader.tpu)
                             {
-                                if let Err(err) = send_wire_transaction(&[0u8], &addr) {
-                                    warn!(
-                                        "Failed to warmup QUIC connection to the leader {:?}, Error {:?}",
-                                        leader_pubkey, err
-                                    );
+                                match send_wire_transaction_async(vec![0u8], &addr) {
+                                    Err(err) => {
+                                        warn!(
+                                            "Failed to warmup QUIC connection to the leader {:?}, {} Error {:?}",
+                                            leader_pubkey, addr, err
+                                        );
+                                    },
+                                    Ok(_) => {
+                                        info!("quic success to {}", addr);
+                                    }
                                 }
                             }
                         }

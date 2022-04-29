@@ -1855,7 +1855,7 @@ impl ReplayStage {
         }
         let vote_account = match bank.get_vote_account(vote_account_pubkey) {
             None => {
-                warn!(
+                debug!(
                     "Vote account {} does not exist.  Unable to vote",
                     vote_account_pubkey,
                 );
@@ -2900,8 +2900,8 @@ impl ReplayStage {
                     .clone();
                 let duration = prog.replay_stats.started.elapsed().as_millis();
                 if bank.is_frozen() && tower.is_slot_confirmed(*slot, voted_stakes, total_stake) {
-                    info!("validator fork confirmed {} {}ms", *slot, duration);
-                    datapoint_info!("validator-confirmation", ("duration_ms", duration, i64));
+                    debug!("validator fork confirmed {} {}ms", *slot, duration);
+                    datapoint_debug!("validator-confirmation", ("duration_ms", duration, i64));
                     confirmed_forks.push((*slot, bank.hash()));
                 } else {
                     debug!(

@@ -6165,7 +6165,7 @@ impl AccountsDb {
             }
         }
         measure.stop();
-        inc_new_counter_info!("remove_dead_slots_metadata-ms", measure.as_ms() as usize);
+        inc_new_counter_debug!("remove_dead_slots_metadata-ms", measure.as_ms() as usize);
     }
 
     fn clean_dead_slots_from_accounts_index<'a>(
@@ -6218,7 +6218,7 @@ impl AccountsDb {
             .collect();
         measure.stop();
         accounts_index_root_stats.clean_dead_slot_us += measure.as_us();
-        info!("remove_dead_slots_metadata: slots {:?}", dead_slots);
+        debug!("remove_dead_slots_metadata: slots {:?}", dead_slots);
 
         accounts_index_root_stats.rooted_cleaned_count += rooted_cleaned_count;
         accounts_index_root_stats.unrooted_cleaned_count += unrooted_cleaned_count;

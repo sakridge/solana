@@ -133,7 +133,7 @@ impl ForkInfo {
     ) {
         if let Some(latest_invalid_ancestor) = self.latest_invalid_ancestor {
             if latest_invalid_ancestor <= newly_valid_ancestor {
-                info!("Fork choice for {:?} clearing latest invalid ancestor {:?} because {:?} was duplicate confirmed", my_key, latest_invalid_ancestor, newly_valid_ancestor);
+                debug!("Fork choice for {:?} clearing latest invalid ancestor {:?} because {:?} was duplicate confirmed", my_key, latest_invalid_ancestor, newly_valid_ancestor);
                 self.latest_invalid_ancestor = None;
             }
         }
@@ -151,7 +151,7 @@ impl ForkInfo {
             .map(|latest_invalid_ancestor| newly_invalid_ancestor > latest_invalid_ancestor)
             .unwrap_or(true)
         {
-            info!(
+            debug!(
                 "Fork choice for {:?} setting latest invalid ancestor from {:?} to {}",
                 my_key, self.latest_invalid_ancestor, newly_invalid_ancestor
             );
@@ -653,7 +653,7 @@ impl HeaviestSubtreeForkChoice {
         let fork_info = self.fork_infos.get_mut(&slot_hash_key).unwrap();
         if is_duplicate_confirmed {
             if !fork_info.is_duplicate_confirmed {
-                info!(
+                debug!(
                     "Fork choice setting {:?} to duplicate confirmed",
                     slot_hash_key
                 );
@@ -847,7 +847,7 @@ impl HeaviestSubtreeForkChoice {
         let best_slot_hash_key = self.best_overall_slot();
         let mut best_path: VecDeque<_> = self.ancestor_iterator(best_slot_hash_key).collect();
         best_path.push_front(best_slot_hash_key);
-        info!(
+        debug!(
             "Latest known votes by vote pubkey: {:#?}, best path: {:?}",
             self.latest_votes,
             best_path.iter().rev().collect::<Vec<&SlotHashKey>>()
@@ -942,7 +942,7 @@ impl ForkChoice for HeaviestSubtreeForkChoice {
         );
         start.stop();
 
-        datapoint_info!(
+        datapoint_debug!(
             "compute_bank_stats-best_slot",
             ("computed_slot", bank.slot(), i64),
             ("overall_best_slot", best_overall_slot, i64),
@@ -983,7 +983,7 @@ impl ForkChoice for HeaviestSubtreeForkChoice {
     }
 
     fn mark_fork_invalid_candidate(&mut self, invalid_slot_hash_key: &SlotHashKey) {
-        info!(
+        debug!(
             "marking fork starting at: {:?} invalid candidate",
             invalid_slot_hash_key
         );
@@ -1010,7 +1010,7 @@ impl ForkChoice for HeaviestSubtreeForkChoice {
     }
 
     fn mark_fork_valid_candidate(&mut self, valid_slot_hash_key: &SlotHashKey) -> Vec<SlotHashKey> {
-        info!(
+        debug!(
             "marking fork starting at: {:?} valid candidate",
             valid_slot_hash_key
         );

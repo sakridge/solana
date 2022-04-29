@@ -2282,7 +2282,7 @@ impl Bank {
                 unix_timestamp = ancestor_timestamp;
             }
         }
-        datapoint_info!(
+        datapoint_debug!(
             "bank-timestamp-correction",
             ("slot", self.slot(), i64),
             ("from_genesis", self.unix_timestamp_from_genesis(), i64),
@@ -2953,7 +2953,7 @@ impl Bank {
                 .is_active(&feature_set::warp_timestamp_again::id()),
         );
         get_timestamp_estimate_time.stop();
-        datapoint_info!(
+        datapoint_debug!(
             "bank-timestamp",
             (
                 "get_timestamp_estimate_us",
