@@ -155,6 +155,7 @@ impl AncestorHashesService {
             "ancestor_hashes_response_receiver",
             1,
             false,
+            None,
         );
 
         let ancestor_hashes_request_statuses: Arc<DashMap<Slot, DeadSlotAncestorRequestStatus>> =
@@ -916,6 +917,7 @@ mod test {
                 "serve_repair_receiver",
                 1,
                 false,
+                None,
             );
             let t_listen = ServeRepair::listen(
                 responder_serve_repair,

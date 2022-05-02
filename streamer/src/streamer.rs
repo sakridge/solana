@@ -19,7 +19,7 @@ use {
             atomic::{AtomicBool, Ordering},
             Arc,
         },
-        thread::{Builder, JoinHandle},
+        thread::{sleep, Builder, JoinHandle},
         time::{Duration, Instant},
     },
     thiserror::Error,
@@ -53,6 +53,7 @@ fn recv_loop(
     name: &'static str,
     coalesce_ms: u64,
     use_pinned_memory: bool,
+    in_vote_only_mode: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let mut recv_count = 0;
     let mut call_count = 0;
@@ -69,6 +70,12 @@ fn recv_loop(
             // (for instance the leader transaction socket)
             if exit.load(Ordering::Relaxed) {
                 return Ok(());
+            }
+            if let Some(ref in_vote_only_mode) = in_vote_only_mode {
+                if in_vote_only_mode.load(Ordering::Relaxed) {
+                    sleep(Duration::from_millis(1));
+                    continue;
+                }
             }
             if let Ok(len) = packet::recv_from(&mut packet_batch, sock, coalesce_ms) {
                 if len == NUM_RCVMMSGS {
@@ -106,6 +113,7 @@ pub fn receiver(
     name: &'static str,
     coalesce_ms: u64,
     use_pinned_memory: bool,
+    in_vote_only_mode: Option<Arc<AtomicBool>>,
 ) -> JoinHandle<()> {
     let res = sock.set_read_timeout(Some(Duration::new(1, 0)));
     assert!(res.is_ok(), "streamer::receiver set_read_timeout error");
@@ -121,6 +129,7 @@ pub fn receiver(
                 name,
                 coalesce_ms,
                 use_pinned_memory,
+                in_vote_only_mode,
             );
         })
         .unwrap()
@@ -413,6 +422,7 @@ mod test {
             "test",
             1,
             true,
+            None,
         );
         let t_responder = {
             let (s_responder, r_responder) = unbounded();

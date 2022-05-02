@@ -142,6 +142,7 @@ impl ShredFetchStage {
                     "packet_modifier",
                     1,
                     true,
+                    None,
                 )
             })
             .collect();
