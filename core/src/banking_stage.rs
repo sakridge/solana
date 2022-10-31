@@ -392,6 +392,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         connection_cache: Arc<ConnectionCache>,
         bank_forks: Arc<RwLock<BankForks>>,
+        skip_transaction_execution: bool,
     ) -> Self {
         Self::new_num_threads(
             cluster_info,
@@ -406,6 +407,7 @@ impl BankingStage {
             log_messages_bytes_limit,
             connection_cache,
             bank_forks,
+            skip_transaction_execution,
         )
     }
 
@@ -423,6 +425,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         connection_cache: Arc<ConnectionCache>,
         bank_forks: Arc<RwLock<BankForks>>,
+        skip_transaction_execution: bool,
     ) -> Self {
         assert!(num_threads >= MIN_TOTAL_THREADS);
         // Single thread to generate entries from many banks.
@@ -510,6 +513,7 @@ impl BankingStage {
                             connection_cache,
                             &bank_forks,
                             unprocessed_transaction_storage,
+                            skip_transaction_execution,
                         );
                     })
                     .unwrap()
@@ -629,6 +633,7 @@ impl BankingStage {
         reached_end_of_slot: &mut bool,
         test_fn: &Option<impl Fn()>,
         packets_to_process: &Vec<Arc<ImmutableDeserializedPacket>>,
+        skip_transaction_execution: bool,
     ) -> Option<Vec<usize>> {
         // TODO: Right now we iterate through buffer and try the highest weighted transaction once
         // but we should retry the highest weighted transactions more often.
@@ -657,7 +662,8 @@ impl BankingStage {
                     banking_stage_stats,
                     qos_service,
                     slot_metrics_tracker,
-                    log_messages_bytes_limit
+                    log_messages_bytes_limit,
+                    skip_transaction_execution,
                 ),
                 "process_packets_transactions",
             );
@@ -727,6 +733,7 @@ impl BankingStage {
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
         num_packets_to_process_per_iteration: usize,
         log_messages_bytes_limit: Option<usize>,
+        skip_transaction_execution: bool,
     ) {
         let mut rebuffered_packet_count = 0;
         let mut consumed_buffered_packets_count = 0;
@@ -754,6 +761,7 @@ impl BankingStage {
                     &mut reached_end_of_slot,
                     &test_fn,
                     packets_to_process,
+                    skip_transaction_execution,
                 )
             },
         );
@@ -839,6 +847,7 @@ impl BankingStage {
         connection_cache: &ConnectionCache,
         tracer_packet_stats: &mut TracerPacketStats,
         bank_forks: &Arc<RwLock<BankForks>>,
+        skip_transaction_execution: bool,
     ) {
         if unprocessed_transaction_storage.should_not_process() {
             return;
@@ -901,7 +910,8 @@ impl BankingStage {
                         qos_service,
                         slot_metrics_tracker,
                         UNPROCESSED_BUFFER_STEP_SIZE,
-                        log_messages_bytes_limit
+                        log_messages_bytes_limit,
+                        skip_transaction_execution,
                     ),
                     "consume_buffered_packets",
                 );
@@ -1067,6 +1077,7 @@ impl BankingStage {
         connection_cache: Arc<ConnectionCache>,
         bank_forks: &Arc<RwLock<BankForks>>,
         mut unprocessed_transaction_storage: UnprocessedTransactionStorage,
+        skip_transaction_execution: bool,
     ) {
         let recorder = poh_recorder.read().unwrap().recorder();
         let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -1100,6 +1111,7 @@ impl BankingStage {
                         &connection_cache,
                         &mut tracer_packet_stats,
                         bank_forks,
+                        skip_transaction_execution,
                     ),
                     "process_buffered_packets",
                 );
@@ -1326,6 +1338,89 @@ impl BankingStage {
         }
     }
 
+    fn check_transactions_locked(
+        bank: &Arc<Bank>,
+        poh: &TransactionRecorder,
+        batch: &TransactionBatch,
+        transaction_status_sender: &Option<TransactionStatusSender>,
+        gossip_vote_sender: &ReplayVoteSender,
+        log_messages_bytes_limit: Option<usize>,
+    ) -> ExecuteAndCommitTransactionsOutput {
+        let mut execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
+
+        let (check_transaction_output, load_execute_time) = measure!(
+            bank.check_transactions(
+                batch,
+                MAX_PROCESSING_AGE,
+            ),
+            "check_transactions",
+        );
+        execute_and_commit_timings.load_execute_us = load_execute_time.as_us();
+
+        let CheckTransactionsOutput {
+            mut loaded_transactions,
+            execution_results,
+            mut retryable_transaction_indexes,
+            executed_transactions_count,
+            executed_with_successful_result_count,
+            signature_count,
+            error_counters,
+            ..
+        } = check_transaction_output;
+
+        let (freeze_lock, freeze_lock_time) = measure!(bank.freeze_lock(), "freeze_lock");
+        execute_and_commit_timings.freeze_lock_us = freeze_lock_time.as_us();
+
+        let (record_transactions_summary, record_time) = measure!(
+            Self::record_transactions(bank.slot(), executed_transactions, poh),
+            "record_transactions",
+        );
+        execute_and_commit_timings.record_us = record_time.as_us();
+
+        let RecordTransactionsSummary {
+            result: record_transactions_result,
+            record_transactions_timings,
+            starting_transaction_index,
+        } = record_transactions_summary;
+        execute_and_commit_timings.record_transactions_timings = RecordTransactionsTimings {
+            execution_results_to_transactions_us: execution_results_to_transactions_time.as_us(),
+            ..record_transactions_timings
+        };
+
+        if let Err(recorder_err) = record_transactions_result {
+            inc_new_counter_info!(
+                "banking_stage-record_transactions_retryable_record_txs",
+                executed_transactions_count
+            );
+
+            retryable_transaction_indexes.extend(execution_results.iter().enumerate().filter_map(
+                |(index, execution_result)| execution_result.was_executed().then_some(index),
+            ));
+
+            return ExecuteAndCommitTransactionsOutput {
+                transactions_attempted_execution_count: 0,
+                executed_transactions_count,
+                executed_with_successful_result_count,
+                retryable_transaction_indexes,
+                commit_transactions_result: Err(recorder_err),
+                execute_and_commit_timings,
+                error_counters,
+            };
+        }
+
+        drop(freeze_lock);
+
+        ExecuteAndCommitTransactionsOutput {
+            transactions_attempted_execution_count,
+            executed_transactions_count,
+            executed_with_successful_result_count,
+            retryable_transaction_indexes,
+            commit_transactions_result: Ok(commit_transaction_statuses),
+            execute_and_commit_timings,
+            error_counters,
+        }
+    }
+
     fn execute_and_commit_transactions_locked(
         bank: &Arc<Bank>,
         poh: &TransactionRecorder,
@@ -1364,6 +1459,7 @@ impl BankingStage {
             ),
             "load_execute",
         );
+
         execute_and_commit_timings.load_execute_us = load_execute_time.as_us();
 
         let LoadAndExecuteTransactionsOutput {
@@ -1376,22 +1472,6 @@ impl BankingStage {
             error_counters,
             ..
         } = load_and_execute_transactions_output;
-
-        let transactions_attempted_execution_count = execution_results.len();
-        let (executed_transactions, execution_results_to_transactions_time): (Vec<_>, Measure) = measure!(
-            execution_results
-                .iter()
-                .zip(batch.sanitized_transactions())
-                .filter_map(|(execution_result, tx)| {
-                    if execution_result.was_executed() {
-                        Some(tx.to_versioned_transaction())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            "execution_results_to_transactions",
-        );
 
         let (freeze_lock, freeze_lock_time) = measure!(bank.freeze_lock(), "freeze_lock");
         execute_and_commit_timings.freeze_lock_us = freeze_lock_time.as_us();
@@ -1433,40 +1513,7 @@ impl BankingStage {
             };
         }
 
-        let sanitized_txs = batch.sanitized_transactions();
-        let (commit_time_us, commit_transaction_statuses) = if executed_transactions_count != 0 {
-            Self::commit_transactions(
-                batch,
-                &mut loaded_transactions,
-                execution_results,
-                sanitized_txs,
-                starting_transaction_index,
-                bank,
-                &mut pre_balance_info,
-                &mut execute_and_commit_timings,
-                transaction_status_sender,
-                gossip_vote_sender,
-                signature_count,
-                executed_transactions_count,
-                executed_with_successful_result_count,
-            )
-        } else {
-            (
-                0,
-                vec![CommitTransactionDetails::NotCommitted; execution_results.len()],
-            )
-        };
-
         drop(freeze_lock);
-
-        debug!(
-            "bank: {} process_and_record_locked: {}us record: {}us commit: {}us txs_len: {}",
-            bank.slot(),
-            load_execute_time.as_us(),
-            record_time.as_us(),
-            commit_time_us,
-            sanitized_txs.len(),
-        );
 
         debug!(
             "execute_and_commit_transactions_locked: {:?}",
@@ -1498,6 +1545,7 @@ impl BankingStage {
         gossip_vote_sender: &ReplayVoteSender,
         qos_service: &QosService,
         log_messages_bytes_limit: Option<usize>,
+        skip_transaction_execution: bool,
     ) -> ProcessTransactionBatchOutput {
         let mut cost_model_time = Measure::start("cost_model");
 
@@ -1527,14 +1575,26 @@ impl BankingStage {
         // WouldExceedMaxAccountCostLimit, WouldExceedMaxVoteCostLimit
         // and WouldExceedMaxAccountDataCostLimit
         let mut execute_and_commit_transactions_output =
-            Self::execute_and_commit_transactions_locked(
+            if skip_transaction_execution {
+                Self::check_transactions_locked(
                 bank,
                 poh,
                 &batch,
                 transaction_status_sender,
                 gossip_vote_sender,
                 log_messages_bytes_limit,
-            );
+            )
+
+            } else {
+                Self::execute_and_commit_transactions_locked(
+                bank,
+                poh,
+                &batch,
+                transaction_status_sender,
+                gossip_vote_sender,
+                log_messages_bytes_limit,
+            )
+            };
 
         let mut unlock_time = Measure::start("unlock_time");
         // Once the accounts are new transactions can enter the pipeline to process them
@@ -1691,6 +1751,7 @@ impl BankingStage {
         gossip_vote_sender: &ReplayVoteSender,
         qos_service: &QosService,
         log_messages_bytes_limit: Option<usize>,
+        skip_transaction_execution: bool,
     ) -> ProcessTransactionsSummary {
         let mut chunk_start = 0;
         let mut all_retryable_tx_indexes = vec![];
@@ -1723,6 +1784,7 @@ impl BankingStage {
                 gossip_vote_sender,
                 qos_service,
                 log_messages_bytes_limit,
+                skip_transaction_execution,
             );
 
             let ProcessTransactionBatchOutput {
@@ -1874,6 +1936,7 @@ impl BankingStage {
         qos_service: &'a QosService,
         slot_metrics_tracker: &'a mut LeaderSlotMetricsTracker,
         log_messages_bytes_limit: Option<usize>,
+        skip_transaction_execution: bool,
     ) -> ProcessTransactionsSummary {
         // Convert packets to transactions
         let ((transactions, transaction_to_packet_indexes), packet_conversion_time): (
@@ -1913,6 +1976,7 @@ impl BankingStage {
                 gossip_vote_sender,
                 qos_service,
                 log_messages_bytes_limit,
+                skip_transaction_execution,
             ),
             "process_transaction_time",
         );

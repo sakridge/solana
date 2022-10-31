@@ -175,6 +175,7 @@ pub struct ValidatorConfig {
     pub ledger_column_options: LedgerColumnOptions,
     pub runtime_config: RuntimeConfig,
     pub replay_slots_concurrently: bool,
+    pub bankless_leader: bool,
 }
 
 impl Default for ValidatorConfig {
@@ -237,6 +238,7 @@ impl Default for ValidatorConfig {
             ledger_column_options: LedgerColumnOptions::default(),
             runtime_config: RuntimeConfig::default(),
             replay_slots_concurrently: false,
+            bankless_leader: false,
         }
     }
 }

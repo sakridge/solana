@@ -70,6 +70,12 @@ pub struct Tpu {
     staked_nodes_updater_service: StakedNodesUpdaterService,
 }
 
+struct TpuOptions {
+    tpu_coalesce_ms: u64,
+    tpu_enable_udp: bool,
+    skip_transaction_execution: bool,
+}
+
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -91,7 +97,6 @@ impl Tpu {
         replay_vote_receiver: ReplayVoteReceiver,
         replay_vote_sender: ReplayVoteSender,
         bank_notification_sender: Option<BankNotificationSender>,
-        tpu_coalesce_ms: u64,
         cluster_confirmed_slot_sender: GossipDuplicateConfirmedSlotsSender,
         cost_model: &Arc<RwLock<CostModel>>,
         connection_cache: &Arc<ConnectionCache>,
@@ -99,7 +104,7 @@ impl Tpu {
         log_messages_bytes_limit: Option<usize>,
         staked_nodes: &Arc<RwLock<StakedNodes>>,
         shared_staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
-        tpu_enable_udp: bool,
+        tpu_options: TpuOptions,
     ) -> Self {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -123,9 +128,9 @@ impl Tpu {
             &forwarded_packet_sender,
             forwarded_packet_receiver,
             poh_recorder,
-            tpu_coalesce_ms,
+            tpu_options.tpu_coalesce_ms,
             Some(bank_forks.read().unwrap().get_vote_only_mode_signal()),
-            tpu_enable_udp,
+            tpu_options.tpu_enable_udp,
         );
 
         let staked_nodes_updater_service = StakedNodesUpdaterService::new(
@@ -233,6 +238,7 @@ impl Tpu {
             log_messages_bytes_limit,
             connection_cache.clone(),
             bank_forks.clone(),
+            tpu_options.skip_transaction_execution,
         );
 
         let broadcast_stage = broadcast_type.new_broadcast_stage(

@@ -3991,7 +3991,7 @@ impl Bank {
         }
     }
 
-    pub fn check_transactions(
+    pub fn check_transactions_age(
         &self,
         sanitized_txs: &[SanitizedTransaction],
         lock_results: &[Result<()>],
@@ -4336,24 +4336,42 @@ impl Bank {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn load_and_execute_transactions(
+    pub fn check_transactions(
         &self,
         batch: &TransactionBatch,
         max_age: usize,
-        enable_cpi_recording: bool,
-        enable_log_recording: bool,
-        enable_return_data_recording: bool,
-        timings: &mut ExecuteTimings,
-        account_overrides: Option<&AccountOverrides>,
-        log_messages_bytes_limit: Option<usize>,
-    ) -> LoadAndExecuteTransactionsOutput {
+    ) {
         let sanitized_txs = batch.sanitized_transactions();
-        debug!("processing transactions: {}", sanitized_txs.len());
-        inc_new_counter_info!("bank-process_transactions", sanitized_txs.len());
         let mut error_counters = TransactionErrorMetrics::default();
+        let retryable_transaction_indexes = Self::generate_retryable_indexes(batch, &mut error_counters);
 
-        let retryable_transaction_indexes: Vec<_> = batch
+        let mut check_time = Measure::start("check_transactions_age");
+        let check_results = self.check_transactions_age(
+            sanitized_txs,
+            batch.lock_results(),
+            max_age,
+            &mut error_counters,
+        );
+        check_time.stop();
+
+        let mut loaded_transactions = self.rc.accounts.load_accounts(
+            &self.ancestors,
+            sanitized_txs,
+            check_results,
+            &self.blockhash_queue.read().unwrap(),
+            &mut error_counters,
+            &self.rent_collector,
+            &self.feature_set,
+            &self.fee_structure,
+            None,
+        );
+    }
+
+    fn generate_retryable_indexes(
+        batch: &TransactionBatch,
+        error_counters: &mut TransactionErrorMetrics,
+        ) -> Vec<usize> {
+        batch
             .lock_results()
             .iter()
             .enumerate()
@@ -4387,10 +4405,30 @@ impl Bank {
                 Err(_) => None,
                 Ok(_) => None,
             })
-            .collect();
+            .collect()
+    }
 
-        let mut check_time = Measure::start("check_transactions");
-        let check_results = self.check_transactions(
+    #[allow(clippy::type_complexity)]
+    pub fn load_and_execute_transactions(
+        &self,
+        batch: &TransactionBatch,
+        max_age: usize,
+        enable_cpi_recording: bool,
+        enable_log_recording: bool,
+        enable_return_data_recording: bool,
+        timings: &mut ExecuteTimings,
+        account_overrides: Option<&AccountOverrides>,
+        log_messages_bytes_limit: Option<usize>,
+    ) -> LoadAndExecuteTransactionsOutput {
+        let sanitized_txs = batch.sanitized_transactions();
+        debug!("processing transactions: {}", sanitized_txs.len());
+        inc_new_counter_info!("bank-process_transactions", sanitized_txs.len());
+        let mut error_counters = TransactionErrorMetrics::default();
+
+        let retryable_transaction_indexes = Self::generate_retryable_indexes(batch, &mut error_counters);
+
+        let mut check_time = Measure::start("check_transactions_age");
+        let check_results = self.check_transactions_age(
             sanitized_txs,
             batch.lock_results(),
             max_age,
@@ -7740,7 +7778,7 @@ impl Bank {
             MAX_TRANSACTION_FORWARDING_DELAY_GPU
         };
 
-        self.check_transactions(
+        self.check_transactions_age(
             transactions,
             filter,
             (MAX_PROCESSING_AGE)
