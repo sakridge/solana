@@ -5488,6 +5488,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-connection-dos"
+version = "1.16.0"
+dependencies = [
+ "clap 2.33.3",
+ "log",
+ "quinn",
+ "rand 0.7.3",
+ "rayon",
+ "rustls 0.20.6",
+ "solana-client",
+ "solana-core",
+ "solana-gossip",
+ "solana-local-cluster",
+ "solana-logger 1.16.0",
+ "solana-measure",
+ "solana-rpc",
+ "solana-sdk 1.16.0",
+ "solana-streamer",
+ "solana-version",
+ "tokio",
+]
+
+[[package]]
 name = "solana-core"
 version = "1.16.0"
 dependencies = [
