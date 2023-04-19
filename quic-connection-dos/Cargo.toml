@@ -12,6 +12,7 @@ edition = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 rustls = { workspace = true, features = ["dangerous_configuration"] }

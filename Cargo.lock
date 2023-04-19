@@ -5494,6 +5494,7 @@ dependencies = [
  "clap 2.33.3",
  "log",
  "quinn",
+ "quinn-proto",
  "rand 0.7.3",
  "rayon",
  "rustls 0.20.6",

@@ -69,63 +69,40 @@ pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
     config
 }
 
-pub async fn make_client_endpoint(
+/*pub fn make_client_endpoint(
     addr: &SocketAddr,
     client_keypair: Option<&Keypair>,
-) -> Connection {
-    let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut endpoint =
-        quinn::Endpoint::new(EndpointConfig::default(), None, client_socket, TokioRuntime).unwrap();
-    let default_keypair = Keypair::new();
-    endpoint.set_default_client_config(get_client_config(
-        client_keypair.unwrap_or(&default_keypair),
-    ));
-    endpoint
-        .connect(*addr, "localhost")
-        .expect("Failed in connecting")
-        .await
-        .expect("Failed in waiting")
-}
+) -> (quinn_proto::ConnectionHandle, quinn_proto::Connection) {
+}*/
 
-async fn run_connection_dos(server_address: SocketAddr, num_connections: u64, num_iterations: u64) {
-    let mut connections = vec![];
-    for _ in 0..num_connections {
-        connections.push(make_client_endpoint(&server_address, None).await);
-    }
+fn run_connection_dos(server_address: SocketAddr, num_connections: u64, num_iterations: u64) {
+    warn!("connecting...");
+    let mut endpoint = quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let default_keypair = Keypair::new();
+    /*endpoint.set_default_client_config(get_client_config(
+        client_keypair.unwrap_or(&default_keypair),
+    ));*/
+    let client_config = get_client_config(&default_keypair);
+
+    //let (handle, mut connection) = make_client_endpoint(&server_address, None);
+    let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut last_print = Instant::now();
-    let mut errors = 0;
-    let mut success = 0;
-    for i in 0..num_iterations {
-        let mut conn_errors = vec![];
-        for (j, c) in connections.iter().enumerate() {
-            match c.open_uni().await {
-                Ok(mut stream) => {
-                    if let Err(e) = stream.write_all(&[0u8]).await {
-                        debug!("error from stream write: {:?}", e);
-                        errors += 1;
-                    }
-                    if let Err(e) = stream.finish().await {
-                        debug!("error from stream finish: {:?}", e);
-                        errors += 1;
-                    } else {
-                        success += 1;
-                    }
-                }
-                Err(e) => {
-                    conn_errors.push(j);
-                    debug!("error from open stream: {:?}", e);
-                    errors += 1;
-                }
-            }
-        }
-        for e in conn_errors.iter().take(thread_rng().gen_range(1, 10)) {
-            connections[*e] = make_client_endpoint(&server_address, None).await;
-        }
-        if last_print.elapsed().as_secs() >= 2 {
-            warn!("iterations: {} errors: {} success: {}", i, errors, success);
+    let mut count = 0;
+    warn!("sending stuff...");
+    for i in 0..100_000_000 {
+        let (connection_handle, mut connection) = endpoint
+            .connect(client_config.clone(), server_address, "localhost")
+            .expect("Failed in connecting");
+        let transmit = connection.poll_transmit(Instant::now(), 1).unwrap();
+
+        client_socket.send_to(&transmit.contents, transmit.destination);
+        count += 1;
+        //warn!("{}", last_print.elapsed().as_millis());
+        if last_print.elapsed().as_millis() >= 500 {
+            warn!("count: {count}");
+            count = 0;
             last_print = Instant::now();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -168,11 +145,7 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(run_connection_dos(
-        target_address,
-        num_connections,
-        num_iterations,
-    ));
+    run_connection_dos(target_address, num_connections, num_iterations);
 }
 
 #[cfg(test)]
@@ -232,6 +205,6 @@ pub mod test {
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(run_connection_dos(tpu, 1000, 10_000));
+        run_connection_dos(tpu, 1000, 100_000);
     }
 }
