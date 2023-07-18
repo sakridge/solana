@@ -816,6 +816,7 @@ fn poll_blockhash<T: BenchTpsClient + ?Sized>(
 ) {
     let mut blockhash_last_updated = Instant::now();
     let mut last_error_log = Instant::now();
+    let mut last_balance_log = Instant::now();
     loop {
         let blockhash_updated = {
             let old_blockhash = *blockhash.read().unwrap();
@@ -837,7 +838,7 @@ fn poll_blockhash<T: BenchTpsClient + ?Sized>(
             }
         };
 
-        if blockhash_updated {
+        if blockhash_updated && last_balance_log.elapsed().as_secs() >= 5 {
             let balance = client.get_balance(id).unwrap_or(0);
             metrics_submit_lamport_balance(balance);
             datapoint_info!(
@@ -847,7 +848,8 @@ fn poll_blockhash<T: BenchTpsClient + ?Sized>(
                     blockhash_last_updated.elapsed().as_millis(),
                     i64
                 )
-            )
+            );
+            last_balance_log = Instant::now();
         }
 
         if exit_signal.load(Ordering::Relaxed) {
