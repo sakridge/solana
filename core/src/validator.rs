@@ -451,7 +451,7 @@ pub struct Validator {
     completed_data_sets_service: CompletedDataSetsService,
     snapshot_packager_service: Option<SnapshotPackagerService>,
     poh_recorder: Arc<RwLock<PohRecorder>>,
-    poh_service: PohService,
+    poh_service: Option<PohService>,
     tpu: Tpu,
     tvu: Tvu,
     ip_echo_server: Option<solana_net_utils::IpEchoServer>,
@@ -1075,15 +1075,21 @@ impl Validator {
         let wait_for_vote_to_start_leader =
             !waited_for_supermajority && !config.no_wait_for_vote_to_start_leader;
 
-        let poh_service = PohService::new(
-            poh_recorder.clone(),
-            &genesis_config.poh_config,
-            exit.clone(),
-            bank_forks.read().unwrap().root_bank().ticks_per_slot(),
-            config.poh_pinned_cpu_core,
-            config.poh_hashes_per_batch,
-            record_receiver,
-        );
+        let poh_service = if config.voting_disabled {
+            warn!("not starting poh service");
+            None
+        } else {
+            warn!("starting poh service");
+            Some(PohService::new(
+                    poh_recorder.clone(),
+                    &genesis_config.poh_config,
+                    exit.clone(),
+                    bank_forks.read().unwrap().root_bank().ticks_per_slot(),
+                    config.poh_pinned_cpu_core,
+                    config.poh_hashes_per_batch,
+                    record_receiver,
+            ))
+        };
         assert_eq!(
             blockstore.get_new_shred_signals_len(),
             1,
@@ -1255,7 +1261,7 @@ impl Validator {
         let cluster_type = bank_forks.read().unwrap().root_bank().cluster_type();
         metrics_config_sanity_check(cluster_type)?;
 
-        datapoint_info!(
+        datapoint_warn!(
             "validator-new",
             ("id", id.to_string(), String),
             ("version", solana_version::version!(), String),
@@ -1341,7 +1347,9 @@ impl Validator {
         drop(self.bank_forks);
         drop(self.cluster_info);
 
-        self.poh_service.join().expect("poh_service");
+        if let Some(poh_service) = self.poh_service {
+            poh_service.join().expect("poh_service");
+        }
         drop(self.poh_recorder);
 
         if let Some(json_rpc_service) = self.json_rpc_service {

@@ -312,6 +312,46 @@ fn test_spend_and_verify_all_nodes_env_num_nodes() {
 
 #[test]
 #[serial]
+fn test_voting_disabled() {
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    error!("test_voting_disabled");
+    let validator_config = ValidatorConfig::default_for_test();
+    let mut non_vote_validator_config = ValidatorConfig::default_for_test();
+    non_vote_validator_config.voting_disabled = true;
+    let num_ticks_per_second = 100;
+    let num_ticks_per_slot = 10;
+    let num_slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH;
+
+    let mut cluster = LocalCluster::new(
+        &mut ClusterConfig {
+            node_stakes: vec![DEFAULT_NODE_STAKE * 100, 1],
+            cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + DEFAULT_NODE_STAKE * 100,
+            validator_configs: vec![validator_config, non_vote_validator_config],
+            ticks_per_slot: num_ticks_per_slot,
+            slots_per_epoch: num_slots_per_epoch,
+            stakers_slot_offset: num_slots_per_epoch,
+            poh_config: PohConfig::new_sleep(Duration::from_millis(1000 / num_ticks_per_second)),
+            ..ClusterConfig::default()
+        },
+        SocketAddrSpace::Unspecified,
+    );
+
+    warn!("sleeping n epochs");
+    cluster_tests::sleep_n_epochs(
+        10.0,
+        &cluster.genesis_config.poh_config,
+        num_ticks_per_slot,
+        num_slots_per_epoch,
+    );
+    cluster.close_preserve_ledgers();
+    let leader_pubkey = *cluster.entry_point_info.pubkey();
+    let leader_ledger = cluster.validators[&leader_pubkey].info.ledger_path.clone();
+    cluster_tests::verify_ledger_ticks(&leader_ledger, num_ticks_per_slot as usize);
+}
+
+
+#[test]
+#[serial]
 fn test_two_unbalanced_stakes() {
     solana_logger::setup_with_default(RUST_LOG_FILTER);
     error!("test_two_unbalanced_stakes");
