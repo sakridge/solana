@@ -31,7 +31,7 @@ impl LeaderExecuteAndCommitTimings {
     }
 
     pub fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_execute_and_commit_timings",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),
@@ -47,7 +47,7 @@ impl LeaderExecuteAndCommitTimings {
             ),
         );
 
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_record_timings",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),
@@ -146,7 +146,7 @@ impl OuterLoopTimings {
     }
 
     fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_loop_timings",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),
@@ -189,7 +189,7 @@ pub(crate) struct ProcessBufferedPacketsTimings {
 }
 impl ProcessBufferedPacketsTimings {
     fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_process_buffered_packets_timings",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),
@@ -213,7 +213,7 @@ pub(crate) struct ConsumeBufferedPacketsTimings {
 
 impl ConsumeBufferedPacketsTimings {
     fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_consume_buffered_packets_timings",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),
@@ -245,7 +245,7 @@ pub(crate) struct ProcessPacketsTimings {
 
 impl ProcessPacketsTimings {
     fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_process_packets_timings",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),

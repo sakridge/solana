@@ -45,7 +45,7 @@ impl ReplaySlotStats {
         bank_complete_time_us: u64,
     ) {
         lazy! {
-            datapoint_info!(
+            datapoint_debug!(
                 "replay-slot-stats",
                 ("slot", slot as i64, i64),
                 ("fetch_entries_time", self.fetch_elapsed as i64, i64),

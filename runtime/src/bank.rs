@@ -2077,7 +2077,7 @@ impl Bank {
                 unix_timestamp = ancestor_timestamp;
             }
         }
-        datapoint_info!(
+        datapoint_debug!(
             "bank-timestamp-correction",
             ("slot", self.slot(), i64),
             ("from_genesis", self.unix_timestamp_from_genesis(), i64),

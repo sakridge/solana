@@ -489,7 +489,7 @@ impl Validator {
         let id = identity_keypair.pubkey();
         assert_eq!(&id, node.info.pubkey());
 
-        info!("identity pubkey: {id}");
+        warn!("identity pubkey: {id}");
         info!("vote account pubkey: {vote_account}");
 
         if !config.no_os_network_stats_reporting {

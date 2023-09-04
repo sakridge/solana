@@ -146,7 +146,7 @@ impl LeaderSlotPacketCountMetrics {
     }
 
     fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-leader_slot_packet_counts",
             ("id", id as i64, i64),
             ("slot", slot as i64, i64),
@@ -334,7 +334,7 @@ impl VotePacketCountMetrics {
     }
 
     fn report(&self, id: u32, slot: Slot) {
-        datapoint_info!(
+        datapoint_debug!(
             "banking_stage-vote_packet_counts",
             ("id", id, i64),
             ("slot", slot, i64),

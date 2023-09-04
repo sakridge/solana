@@ -287,7 +287,7 @@ pub struct ThreadExecuteTimings {
 impl ThreadExecuteTimings {
     pub fn report_stats(&self, slot: Slot) {
         lazy! {
-            datapoint_info!(
+            datapoint_debug!(
                 "replay-slot-end-to-end-stats",
                 ("slot", slot as i64, i64),
                 ("total_thread_us", self.total_thread_us as i64, i64),

@@ -471,7 +471,7 @@ impl QosServiceMetrics {
 
     pub fn report(&self, bank_slot: Slot) {
         if bank_slot != self.slot.load(Ordering::Relaxed) {
-            datapoint_info!(
+            datapoint_debug!(
                 "qos-service-stats",
                 ("id", self.id, i64),
                 ("bank_slot", bank_slot, i64),
@@ -539,7 +539,7 @@ impl QosServiceMetrics {
                     i64
                 ),
             );
-            datapoint_info!(
+            datapoint_debug!(
                 "qos-service-errors",
                 ("id", self.id, i64),
                 ("bank_slot", bank_slot, i64),

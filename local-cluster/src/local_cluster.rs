@@ -339,6 +339,7 @@ impl LocalCluster {
                 )
             })
             .collect();
+        warn!("adding validators..");
         for (stake, validator_config, (key, _)) in izip!(
             config.node_stakes[1..].iter(),
             config.validator_configs[1..].iter(),
@@ -352,6 +353,7 @@ impl LocalCluster {
                 socket_addr_space,
             );
         }
+        warn!("done adding validators..");
 
         let mut listener_config = safe_clone_config(&config.validator_configs[0]);
         listener_config.voting_disabled = true;
@@ -365,6 +367,7 @@ impl LocalCluster {
             );
         });
 
+        warn!("discovering cluster..");
         discover_cluster(
             &cluster.entry_point_info.gossip().unwrap(),
             config.node_stakes.len() + config.num_listeners as usize,
