@@ -201,6 +201,87 @@ fn test_spend_and_verify_all_nodes_3() {
 
 #[test]
 #[serial]
+fn test_local_cluster_rpc() {
+    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    let num_nodes = 2;
+    let cluster = LocalCluster::new_with_equal_stakes(
+        num_nodes,
+        DEFAULT_CLUSTER_LAMPORTS,
+        DEFAULT_NODE_STAKE,
+        SocketAddrSpace::Unspecified,
+    );
+    let nodes = cluster.get_node_pubkeys();
+
+    // Get non leader
+    let non_bootstrap_id = nodes
+        .into_iter()
+        .find(|id| id != cluster.entry_point_info.pubkey())
+        .unwrap();
+    let non_bootstrap_info = cluster.get_contact_info(&non_bootstrap_id).unwrap();
+
+    let (rpc, tpu) = LegacyContactInfo::try_from(non_bootstrap_info)
+        .map(|node| {
+            cluster_tests::get_client_facing_addr(cluster.connection_cache.protocol(), node)
+        })
+        .unwrap();
+    let tx_client = ThinClient::new(rpc, tpu, cluster.connection_cache.clone());
+
+    let (blockhash, _) = tx_client
+        .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+        .unwrap();
+
+    let mut transaction = system_transaction::transfer(
+        &cluster.funding_keypair,
+        &solana_sdk::pubkey::new_rand(),
+        10,
+        blockhash,
+    );
+
+    let (mut sig_subscribe_client, receiver) = PubsubClient::signature_subscribe(
+        &format!("ws://{}", non_bootstrap_info.rpc_pubsub().unwrap()),
+        &transaction.signatures[0],
+        Some(RpcSignatureSubscribeConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            enable_received_notification: Some(true),
+        }),
+    )
+    .unwrap();
+
+    tx_client
+        .retry_transfer(&cluster.funding_keypair, &mut transaction, 5)
+        .unwrap();
+
+    let mut got_received_notification = false;
+    loop {
+        let responses: Vec<_> = receiver.try_iter().collect();
+        let mut should_break = false;
+        for response in responses {
+            match response.value {
+                RpcSignatureResult::ProcessedSignature(_) => {
+                    should_break = true;
+                    break;
+                }
+                RpcSignatureResult::ReceivedSignature(_) => {
+                    got_received_notification = true;
+                }
+            }
+        }
+
+        if should_break {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    // If we don't drop the cluster, the blocking web socket service
+    // won't return, and the `sig_subscribe_client` won't shut down
+    drop(cluster);
+    sig_subscribe_client.shutdown().unwrap();
+    assert!(got_received_notification);
+}
+
+#[test]
+#[serial]
 #[ignore]
 fn test_local_cluster_signature_subscribe() {
     solana_logger::setup_with_default(RUST_LOG_FILTER);
@@ -239,10 +320,7 @@ fn test_local_cluster_signature_subscribe() {
     );
 
     let (mut sig_subscribe_client, receiver) = PubsubClient::signature_subscribe(
-        &format!(
-            "ws://{}",
-            &non_bootstrap_info.rpc_pubsub().unwrap().to_string()
-        ),
+        &format!("ws://{}", non_bootstrap_info.rpc_pubsub().unwrap()),
         &transaction.signatures[0],
         Some(RpcSignatureSubscribeConfig {
             commitment: Some(CommitmentConfig::processed()),
