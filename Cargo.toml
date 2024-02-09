@@ -17,6 +17,7 @@ members = [
     "bench-tps",
     "bloom",
     "bucket_map",
+    "send-tx",
     "clap-utils",
     "clap-v3-utils",
     "cli",

@@ -1,0 +1,21 @@
+[package]
+name = "send-tx"
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+solana-sdk = { workspace = true }
+clap = { workspace = true }
+solana-clap-utils = { workspace = true }
+solana-cli-config = { workspace = true }
+solana-client = { workspace = true }
+regex = { workspace = true }
+rayon = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }

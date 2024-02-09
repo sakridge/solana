@@ -4750,6 +4750,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "send-tx"
+version = "1.17.21"
+dependencies = [
+ "clap 2.33.3",
+ "log",
+ "rand 0.8.5",
+ "rayon",
+ "regex",
+ "solana-clap-utils",
+ "solana-cli-config",
+ "solana-client",
+ "solana-sdk",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
