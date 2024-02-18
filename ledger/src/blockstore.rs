@@ -3307,16 +3307,16 @@ impl Blockstore {
         }
         let slot_meta = slot_meta.unwrap();
 
-        let entries: Vec<Vec<Entry>> = PAR_THREAD_POOL_ALL_CPUS.install(|| {
+        PAR_THREAD_POOL_ALL_CPUS.install(|| {
             completed_ranges
                 .par_iter()
                 .map(|(start_index, end_index)| {
                     self.get_entries_in_data_block(slot, *start_index, *end_index, Some(&slot_meta))
                         .unwrap_or_default()
                 })
+                .flatten()
                 .collect()
-        });
-        entries.into_iter().flatten().collect()
+        })
     }
 
     /// Returns a mapping from each elements of `slots` to a list of the
