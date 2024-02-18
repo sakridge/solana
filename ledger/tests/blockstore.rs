@@ -1,9 +1,11 @@
 use {
+    log::*,
     solana_entry::entry,
     solana_ledger::{
         blockstore::{self, make_many_slot_entries, test_all_empty_or_min, Blockstore},
         get_tmp_ledger_path_auto_delete,
     },
+    solana_measure::measure::Measure,
     solana_sdk::hash::Hash,
     std::{sync::Arc, thread::Builder},
 };
@@ -56,12 +58,23 @@ fn test_multiple_threads_insert_shred() {
 
 #[test]
 fn test_purge_huge() {
+    solana_logger::setup();
     let ledger_path = get_tmp_ledger_path_auto_delete!();
     let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
-    let (shreds, _) = make_many_slot_entries(0, 5000, 10);
+    let start_slot = 0;
+    let entries_per_slot = 10;
+    let num_slots = 50_000;
+    let mut make_time = Measure::start("make_shreds");
+    let (shreds, _) = make_many_slot_entries(start_slot, num_slots, entries_per_slot);
+    make_time.stop();
+    let mut insert_time = Measure::start("insert_shreds");
     blockstore.insert_shreds(shreds, None, false).unwrap();
+    insert_time.stop();
 
-    blockstore.purge_and_compact_slots(0, 4999);
-    test_all_empty_or_min(&blockstore, 5000);
+    let mut purge_time = Measure::start("purge_shreds");
+    blockstore.purge_and_compact_slots(0, num_slots - 1);
+    purge_time.stop();
+    test_all_empty_or_min(&blockstore, num_slots);
+    warn!("{} {} {}", make_time, insert_time, purge_time);
 }
