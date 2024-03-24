@@ -120,7 +120,7 @@ fn process_rewards(
             crate::stake::get_epoch_boundary_timestamps(rpc_client, first_reward, &epoch_schedule)?;
         for (reward, address) in rewards.iter().zip(addresses) {
             let cli_reward = reward.as_ref().and_then(|reward| {
-                crate::stake::make_cli_reward(reward, epoch_start_time, epoch_end_time)
+                crate::stake::make_cli_reward(reward, epoch_start_time, epoch_end_time, false)
             });
             epoch_rewards.push(CliKeyedEpochReward {
                 address: address.to_string(),
