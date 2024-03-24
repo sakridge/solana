@@ -5774,6 +5774,7 @@ dependencies = [
  "solana-faucet",
  "solana-loader-v4-program",
  "solana-logger",
+ "solana-measure",
  "solana-program-runtime",
  "solana-pubsub-client",
  "solana-quic-client",

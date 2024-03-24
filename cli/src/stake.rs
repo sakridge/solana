@@ -29,6 +29,7 @@ use {
         CliEpochReward, CliStakeHistory, CliStakeHistoryEntry, CliStakeState, CliStakeType,
         OutputFormat, ReturnSignersConfig,
     },
+    solana_measure::measure::Measure,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
@@ -2488,6 +2489,7 @@ pub fn make_cli_reward(
     reward: &RpcInflationReward,
     epoch_start_time: UnixTimestamp,
     epoch_end_time: UnixTimestamp,
+    use_csv: bool,
 ) -> Option<CliEpochReward> {
     let wallclock_epoch_duration = epoch_end_time.checked_sub(epoch_start_time)?;
     if reward.post_balance > reward.amount {
@@ -2507,6 +2509,7 @@ pub fn make_cli_reward(
             apr: Some(apr * 100.0),
             commission: reward.commission,
             block_time: epoch_end_time,
+            use_csv,
         })
     } else {
         None
@@ -2517,32 +2520,48 @@ pub(crate) fn fetch_epoch_rewards(
     rpc_client: &RpcClient,
     address: &Pubkey,
     mut num_epochs: usize,
+    starting_epoch: Option<u64>,
+    use_csv: bool,
 ) -> Result<Vec<CliEpochReward>, Box<dyn std::error::Error>> {
     let mut all_epoch_rewards = vec![];
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
-    let mut rewards_epoch = rpc_client.get_epoch_info()?.epoch;
+    let mut rewards_epoch = if let Some(epoch) = starting_epoch {
+        epoch
+    } else {
+        rpc_client
+            .get_epoch_info()?
+            .epoch
+            .saturating_sub(1 + num_epochs as u64)
+    };
 
     let mut process_reward =
         |reward: &Option<RpcInflationReward>| -> Result<(), Box<dyn std::error::Error>> {
             if let Some(reward) = reward {
                 let (epoch_start_time, epoch_end_time) =
                     get_epoch_boundary_timestamps(rpc_client, reward, &epoch_schedule)?;
-                if let Some(cli_reward) = make_cli_reward(reward, epoch_start_time, epoch_end_time)
+                if let Some(cli_reward) =
+                    make_cli_reward(reward, epoch_start_time, epoch_end_time, use_csv)
                 {
+                    print!("{}", cli_reward);
                     all_epoch_rewards.push(cli_reward);
                 }
             }
             Ok(())
         };
 
+    let total_epochs = num_epochs;
     while num_epochs > 0 && rewards_epoch > 0 {
-        rewards_epoch = rewards_epoch.saturating_sub(1);
-        if let Ok(rewards) = rpc_client.get_inflation_reward(&[*address], Some(rewards_epoch)) {
+        let mut time = Measure::start("get_inflation_reward");
+        let r = rpc_client.get_inflation_reward(&[*address], Some(rewards_epoch));
+        time.stop();
+        if let Ok(rewards) = r {
             process_reward(&rewards[0])?;
         } else {
             eprintln!("Rewards not available for epoch {rewards_epoch}");
         }
         num_epochs = num_epochs.saturating_sub(1);
+        rewards_epoch = rewards_epoch.saturating_add(1);
+        eprintln!("Fetching {rewards_epoch} ({num_epochs} / {total_epochs}) epochs {time}");
     }
 
     Ok(all_epoch_rewards)
@@ -2590,7 +2609,13 @@ pub fn process_show_stake_account(
 
             if state.stake_type == CliStakeType::Stake && state.activation_epoch.is_some() {
                 let epoch_rewards = with_rewards.and_then(|num_epochs| {
-                    match fetch_epoch_rewards(rpc_client, stake_account_address, num_epochs) {
+                    match fetch_epoch_rewards(
+                        rpc_client,
+                        stake_account_address,
+                        num_epochs,
+                        None,
+                        use_csv,
+                    ) {
                         Ok(rewards) => Some(rewards),
                         Err(error) => {
                             eprintln!("Failed to fetch epoch rewards: {error:?}");

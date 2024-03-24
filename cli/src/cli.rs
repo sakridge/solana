@@ -348,6 +348,7 @@ pub enum CliCommand {
         use_lamports_unit: bool,
         use_csv: bool,
         with_rewards: Option<usize>,
+        starting_epoch: Option<u64>,
     },
     WithdrawFromVoteAccount {
         vote_account_pubkey: Pubkey,
@@ -1505,6 +1506,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             use_lamports_unit,
             use_csv,
             with_rewards,
+            starting_epoch,
         } => process_show_vote_account(
             &rpc_client,
             config,
@@ -1512,6 +1514,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             *use_csv,
             *with_rewards,
+            *starting_epoch,
         ),
         CliCommand::WithdrawFromVoteAccount {
             vote_account_pubkey,
