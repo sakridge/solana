@@ -30,7 +30,7 @@ use {
     },
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_rpc_client_api::config::RpcTransactionConfig,
+    solana_rpc_client_api::{request::TokenAccountsFilter, config::RpcTransactionConfig},
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
     solana_sdk::{
         commitment_config::CommitmentConfig,
@@ -655,6 +655,28 @@ pub fn process_show_account(
     use_lamports_unit: bool,
 ) -> ProcessResult {
     let account = rpc_client.get_account(account_pubkey)?;
+    let filter = TokenAccountsFilter::ProgramId(solana_inline_spl::token::id());
+    let accounts_by_owner = rpc_client.get_token_accounts_by_owner(account_pubkey, filter);
+    //println!("accounts_by_owner: {:?}", accounts_by_owner);
+    if let Ok(token_accounts) = accounts_by_owner {
+        for ta in token_accounts {
+            match ta.account.data {
+                solana_account_decoder::UiAccountData::Json(parsed) => {
+                    if let Some(info) = parsed.parsed.get("info") {
+                        //println!(" info: {:?}", info);
+                        //println!(" tokenAmount: {:?}", info.get("tokenAmount"));
+                        if let Some(amount) = info.get("tokenAmount") {
+                            if let Some(owner) = info.get("mint") {
+                                println!("  token account: {:<46} {}", owner.to_string(), amount.get("uiAmount").unwrap());
+                            }
+                        }
+                    }
+                },
+                _ => {
+                },
+            }
+        }
+    }
     let data = &account.data;
     let cli_account = CliAccount::new(account_pubkey, &account, use_lamports_unit);
 
