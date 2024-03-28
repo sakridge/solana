@@ -74,7 +74,8 @@ impl BgThreads {
                     let system_exit = exit.clone();
                     let in_mem_ = in_mem.to_vec();
 
-                    // note that using rayon here causes us to exhaust # rayon threads and many tests running in parallel deadlock
+                    // note that using rayon here causes us to exhaust #
+                    // rayon threads and many tests running in parallel deadlock
                     Builder::new()
                         .name(format!("solIdxFlusher{idx:02}"))
                         .spawn(move || {
