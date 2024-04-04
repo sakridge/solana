@@ -2,6 +2,7 @@
 pub mod nonblocking;
 pub mod packet;
 pub mod quic;
+pub mod quic_quiche;
 pub mod recvmmsg;
 pub mod sendmmsg;
 pub mod socket;
