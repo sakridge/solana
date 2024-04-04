@@ -22,13 +22,16 @@ log = { workspace = true }
 nix = { workspace = true }
 pem = { workspace = true }
 percentage = { workspace = true }
+quiche = "0.20.1"
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 rand = { workspace = true }
+ring = "0.17.8"
 rustls = { workspace = true, features = ["dangerous_configuration"] }
 solana-metrics = { workspace = true }
 solana-perf = { workspace = true }
 solana-sdk = { workspace = true }
+tempfile = "3.10.1"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 x509-parser = { workspace = true }
