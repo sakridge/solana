@@ -12,7 +12,9 @@ edition = { workspace = true }
 [dependencies]
 async-channel = { workspace = true }
 bytes = { workspace = true }
+boring = "4.5.0"
 crossbeam-channel = { workspace = true }
+ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
 histogram = { workspace = true }
 indexmap = { workspace = true }
@@ -22,13 +24,15 @@ log = { workspace = true }
 nix = { workspace = true, features = ["net"] }
 pem = { workspace = true }
 percentage = { workspace = true }
-quiche = "0.20.1"
+quiche = { version = "0.20.1", features = ["boringssl-boring-crate"] }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 rand = { workspace = true }
 ring = "0.17.8"
 rustls = { workspace = true, features = ["dangerous_configuration"] }
 smallvec = { workspace = true }
+siphasher = "1.0.1"
+socket2 = { workspace = true }
 solana-measure = { workspace = true }
 solana-metrics = { workspace = true }
 solana-perf = { workspace = true }

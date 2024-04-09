@@ -1,357 +1,507 @@
 use {
-    crate::{quic::QuicServerError, streamer::StakedNodes,
-        nonblocking::quic::ALPN_TPU_PROTOCOL_ID,
-        tls_certificates::new_dummy_x509_certificate,
+    crate::{
+        buf::{EVENT_CNT, REASM_DEPTH},
+        metrics::ServerMetrics,
+        reasm::Reasm,
     },
-    crossbeam_channel::Sender,
-    quiche::{Connection, ConnectionId},
-    ring::rand::SystemRandom,
+    boring::{
+        pkey::PKey,
+        ssl::{SslContextBuilder, SslMethod, SslVersion},
+        x509::X509,
+    },
+    ed25519_dalek::Keypair,
+    quiche::ConnectionId,
+    rand::{
+        rngs::{OsRng, SmallRng},
+        Rng, RngCore, SeedableRng,
+    },
+    siphasher::sip::SipHasher24,
     solana_perf::packet::PacketBatch,
-    rustls::PrivateKey,
-    solana_sdk::{
-        packet::PACKET_DATA_SIZE,
-        quic::{NotifyKeyUpdate, QUIC_MAX_TIMEOUT, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS},
-        signature::Keypair,
-    },
-    pem::Pem,
     std::{
-        io::Write,
-        collections::HashMap,
+        cell::RefCell,
+        collections::{BinaryHeap, HashMap},
         net::{SocketAddr, UdpSocket},
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
-        },
-        thread,
-        time::{Duration},
+        sync::{atomic::Ordering::Relaxed, Arc},
+        time::Duration,
     },
-    tokio::runtime::Runtime,
 };
 
-pub const MAX_STAKED_CONNECTIONS: usize = 2000;
-pub const MAX_UNSTAKED_CONNECTIONS: usize = 500;
-
-pub struct SpawnServerResult {
-    pub thread: thread::JoinHandle<()>,
-}
-
-/*fn run_server() -> Result<(), QuicServerError> {
-    Ok(())
-}*/
-
-fn validate_token<'a>(
-    src: &std::net::SocketAddr,
-    token: &'a [u8],
-) -> Option<quiche::ConnectionId<'a>> {
-    info!("{:?} string: {:?}", token, String::from_utf8_lossy(token));
-
-    if token.len() < 6 {
-        return None;
-    }
-
-    if &token[..6] != b"quiche" {
-        return None;
-    }
-
-    let token = &token[6..];
-
-    let addr = match src.ip() {
-        std::net::IpAddr::V4(a) => a.octets().to_vec(),
-        std::net::IpAddr::V6(a) => a.octets().to_vec(),
-    };
-
-    if token.len() < addr.len() || &token[..addr.len()] != addr.as_slice() {
-        return None;
-    }
-
-    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
-}
-
-fn mint_token(hdr: &quiche::Header, src: &std::net::SocketAddr) -> Vec<u8> {
-    let mut token = Vec::new();
-
-    token.extend_from_slice(b"quiche");
-
-    let addr = match src.ip() {
-        std::net::IpAddr::V4(a) => a.octets().to_vec(),
-        std::net::IpAddr::V6(a) => a.octets().to_vec(),
-    };
-
-    token.extend_from_slice(&addr);
-    token.extend_from_slice(&hdr.dcid);
-
-    token
-}
-
-#[derive(Default)]
-struct Counters {
-    header_parse_failed: usize,
-    send: usize,
-    send_errors: usize,
-    connection_send_errors: usize,
-    retry_fail: usize,
-    connection_accept_failure: usize,
-    token_validate_fail: usize,
-}
-
-fn quic_process_loop() {}
-
-fn process_new_packet_for_connection(conn: &mut Connection, buf: &mut [u8], from: SocketAddr, local_addr: SocketAddr, len: usize) {
-    let recv_info = quiche::RecvInfo {
-        from,
-        to: local_addr,
-    };
-    match conn.recv(&mut buf[..len], recv_info) {
-        Ok(v) => {
-            info!("read {} bytes?", v);
-        }
-        Err(e) => {
-            error!("{} recv failed: {:?}", conn.trace_id(), e);
-        }
-    };
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_server(
-    thread_name: &'static str,
-    metrics_name: &'static str,
+pub struct ServerTile {
+    local_addr: SocketAddr,
     socket: UdpSocket,
-    keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
-    exit: Arc<AtomicBool>,
-    max_connections_per_peer: usize,
-    staked_nodes: Arc<RwLock<StakedNodes>>,
-    max_staked_connections: usize,
-    max_unstaked_connections: usize,
-    wait_for_chunk_timeout: Duration,
-    coalesce: Duration,
-) -> Result<SpawnServerResult, QuicServerError> {
-    let (cert, priv_key) = new_dummy_x509_certificate(keypair);
-    let thread = thread::Builder::new()
-        .name(thread_name.into())
-        .spawn(move || {
-            let mut counters = Counters::default();
-            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-            config.verify_peer(false);
+    metrics: Arc<ServerMetrics>,
+    packet_batch: RefCell<PacketBatch>,
+    q_initial: Vec<u16>,
+    q_handshake: Vec<(u16, ICID)>,
+    q_established: Vec<(u16, ICID)>,
+    conns: HashMap<ICID, Conn>, // Should probably be a LinkedList
+    conn_ids: HashMap<SCID, ICID>,
+    max_connections: usize,
+    rng: SmallRng,
+    quiche_cfg: quiche::Config,
+    next_icid: u64,
 
-            let alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID];
-            config.set_application_protos(&alpn_protocols).unwrap();
+    // Connections pending serve (this is probably slow)
+    pending_conns: BinaryHeap<ICID>,
 
-            // Set the certificate and private key.
-            //let (cert, priv_key) = new_dummy_x509_certificate(keypair);
-            let cert_chain_pem_parts = vec![Pem {
-                tag: "CERTIFICATE".to_string(),
-                contents: cert.0.clone(),
-            }];
-            let cert_chain_pem = pem::encode_many(&cert_chain_pem_parts);
+    // Cheap mechanism to sign retry requests
+    // Chosen over MAC or OTM functions for better performance
+    retry_signer: SipHasher24,
 
-	    // Create a PEM block
-	    let pem = Pem {
-		tag: String::from("PRIVATE KEY"), // Tag used for private keys
-		contents: priv_key.0,
-	    };
-	    // Encode to PEM format
-	    let pem_str = pem::encode(&pem);
+    // Reassembler for fragmented transaction data
+    reasm: Reasm,
+}
 
-            // Create temporary files to write the certificate and private key data.
-            let mut cert_file = tempfile::NamedTempFile::new().unwrap();
-            let mut priv_key_file = tempfile::NamedTempFile::new().unwrap();
+impl ServerTile {
+    pub fn new(
+        socket: UdpSocket,
+        local_addr: SocketAddr,
+        keypair: &Keypair,
+        max_connections: usize,
+    ) -> Self {
+        let conns = HashMap::with_capacity(max_connections);
+        let conn_ids = HashMap::with_capacity(max_connections * 4);
 
-            // Write the certificate and private key data to the temporary files.
-            cert_file.write_all(&cert_chain_pem.into_bytes()).unwrap();
-            cert_file.flush().unwrap();
+        // TODO should probably only sign this once
+        let (cert_bytes, cert_key_bytes) = crate::cert::new_dummy_x509_certificate(keypair);
+        let cert = X509::from_der(&cert_bytes).unwrap();
+        let cert_key = PKey::private_key_from_der(&cert_key_bytes).unwrap();
 
-            priv_key_file.write_all(&pem_str.into_bytes()).unwrap();
-            priv_key_file.flush().unwrap();
+        let mut tls_cfg = SslContextBuilder::new(SslMethod::tls_server()).unwrap();
+        tls_cfg.set_certificate(&cert).unwrap();
+        tls_cfg.set_private_key(&cert_key).unwrap();
+        tls_cfg
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        tls_cfg
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
 
-            config.load_cert_chain_from_pem_file(cert_file.path().to_str().unwrap()).unwrap();
-            config.load_priv_key_from_pem_file(priv_key_file.path().to_str().unwrap()).unwrap();
+        let mut quiche_cfg = quiche::Config::with_boring_ssl_ctx_builder(1, tls_cfg).unwrap();
+        quiche_cfg.set_application_protos(&[b"solana-tpu"]).unwrap();
+        quiche_cfg.set_initial_max_data(15000);
+        quiche_cfg.set_initial_max_streams_uni(168);
+        quiche_cfg.set_initial_max_stream_data_uni(crate::buf::TXN_MAX_SZ as u64);
+        quiche_cfg.set_max_idle_timeout(3000u64);
 
-            let local_addr = socket.local_addr().unwrap();
-            info!("server addr: {:?}", local_addr);
+        let packet_batch = RefCell::new(PacketBatch::default());
 
-            let rng = SystemRandom::new();
-            let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+        Self {
+            local_addr,
+            socket,
+            packet_batch,
+            metrics: Arc::new(ServerMetrics::default()),
+            q_initial: Vec::with_capacity(EVENT_CNT),
+            q_handshake: Vec::with_capacity(EVENT_CNT),
+            q_established: Vec::with_capacity(EVENT_CNT),
+            conns,
+            conn_ids,
+            max_connections,
+            rng: SmallRng::from_entropy(),
+            quiche_cfg,
+            next_icid: 0u64,
+            pending_conns: BinaryHeap::with_capacity(EVENT_CNT),
+            retry_signer: SipHasher24::new_with_keys(OsRng.next_u64(), OsRng.next_u64()),
+            reasm: Reasm::new(REASM_DEPTH),
+        }
+    }
 
-            // HashMap to store connections for each peer.
-            let mut connections: HashMap<ConnectionId, Connection> = HashMap::new();
-            // Buffer to hold incoming data.
-            let mut buf = [0; 4096];
-            let mut out = [0; 4096];
-            let mut g_packet_batch = None;
+    pub fn metrics(&self) -> Arc<ServerMetrics> {
+        Arc::clone(&self.metrics)
+    }
 
-            while !exit.load(Ordering::Relaxed) {
-                let timeout = connections.values().filter_map(|c| c.timeout()).min();
-                info!("timeout? {:?}", timeout);
+    pub fn run(&mut self) {
+        loop {
+            self.poll();
+        }
+    }
 
-                match socket.recv_from(&mut buf) {
-                    Ok((len, from)) => {
-                        match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
-                            Ok(hdr) => {
-                                info!("got packet({}) from: {} {:?}", len, from, hdr.ty);
-                                // Check if there's an existing connection for this peer, or create a new one.
-                                if hdr.ty == quiche::Type::Initial {
-                                    match connections.get_mut(&hdr.dcid) {
-                                        None => {
-                                            let token = hdr.token.as_ref().unwrap();
+    pub fn poll(&mut self) {
+        self.q_initial.clear();
+        self.q_handshake.clear();
+        self.q_established.clear();
+        self.pending_conns.clear();
 
-                                            let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
-                                            let scid = ConnectionId::from_ref(
-                                                &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN],
-                                            );
-                                            info!("new connection! {:?} {:?}", from, scid);
+        // TODO timeout management
 
-                                            // No token sent by client, create a new one.
-                                            if token.is_empty() {
-                                                let new_token = mint_token(&hdr, &from);
+        let packet_count = crate::packet::recv_from(
+            &mut self.packet_batch.borrow_mut(),
+            &self.socket,
+            Duration::from_millis(100),
+        )
+        .unwrap_or(0);
 
-                                                info!("retry start!");
-                                                match quiche::retry(
-                                                    &hdr.scid,
-                                                    &hdr.dcid,
-                                                    &scid,
-                                                    &new_token,
-                                                    hdr.version,
-                                                    &mut out,
-                                                ) {
-                                                    Ok(len) => {
-                                                        let e =
-                                                            socket.send_to(&out[..len], &from).unwrap();
-                                                        info!("retry success! {:?} sent {} byte packet", e, len);
-                                                    }
-                                                    Err(e) => {
-                                                        info!("retry fail!");
-                                                        counters.retry_fail += 1;
-                                                    }
-                                                }
-                                            }
+        self.metrics
+            .rx_pkt_cnt
+            .fetch_add(packet_count as u64, Relaxed);
 
-                                            let odcid = validate_token(&from, token);
-                                            if odcid.is_some() {
-                                                info!("token validate success!");
-                                                match quiche::accept(
-                                                    &scid,
-                                                    odcid.as_ref(),
-                                                    local_addr,
-                                                    from,
-                                                    &mut config,
-                                                ) {
-                                                    Ok(conn) => {
-                                                        info!("inserting connection?");
-                                                        connections.insert(hdr.dcid, conn);
-                                                    }
-                                                    Err(e) => {
-                                                        info!("fail create connection?: {:?}", e);
-                                                        counters.connection_accept_failure += 1;
-                                                    }
-                                                }
-                                            } else {
-                                                info!("token validate fail");
-                                                counters.token_validate_fail += 1;
-                                            }
-                                        }
-                                        Some(conn) => {
-                                            info!(
-                                                "processing initial packet from established connection: {}",
-                                                from
-                                            );
-                                            process_new_packet_for_connection(conn, &mut buf, from, local_addr, len);
-                                        }
-                                    }
-                                } else {
-                                    info!(
-                                        "processing packet from established connection: {}",
-                                        from
-                                    );
-                                    if let Some(conn) = connections.get_mut(&hdr.dcid) {
-                                        process_new_packet_for_connection(conn, &mut buf, from, local_addr, len);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                counters.header_parse_failed += 1;
-                            }
-                        };
-                    }
-                    Err(e) => {
-                        info!("error recv? {:?}", e);
-                    }
-                }
+        // Triage packets, sorting them into different QoS classes
+        'triage: for pkt_idx in 0..packet_count {
+            let packet = &mut self.packet_batch.borrow_mut()[pkt_idx];
+            //let from_ip_addr = packet.meta().addr;
+            let from_udp_port = packet.meta().port;
 
-                info!("processing {} connections", connections.len());
-                // Handle streams and process outgoing packets for each connection.
-                for conn in connections.values_mut() {
-                    info!("processing connection id: {:?} is_established: {} is_resumed: {} is_in_early_data: {} is_server: {} is_closed: {} is_draining: {} error: {:?}",
-                        conn.trace_id(),
-                        conn.is_established(),
-                        conn.is_resumed(),
-                        conn.is_in_early_data(),
-                        conn.is_server(),
-                        conn.is_closed(),
-                        conn.is_draining(),
-                        conn.peer_error(),
-                        );
-                    info!("stats: {:?}", conn.stats());
-                    // Process incoming streams.
-                    for stream_id in conn.readable() {
-                        info!("processing stream {}", stream_id);
-                        loop {
-                            let mut packet_batch = match g_packet_batch.take() {
-                                Some(b) => b,
-                                None => PacketBatch::with_capacity(1),
-                            };
-                            match conn.stream_recv(stream_id, &mut packet_batch[0].buffer_mut()) {
-                                Ok((read, fin)) => {
-                                    info!(
-                                        "Received data on stream {}: {}",
-                                        stream_id,
-                                        String::from_utf8_lossy(&buf[..read])
-                                    );
-                                    //packet_batch[0].buffer_mut()[..read].copy_from_slice(buf[..read]);
-                                    let _e = packet_sender.send(packet_batch);
-                                }
-                                Err(e) => {
-                                    g_packet_batch = Some(packet_batch);
-                                    info!("stream error: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+            // If the packet comes from a suspiciously well-known port
+            // number, it was likely bounced off a UDP server via a
+            // reflection attack.
+            let is_reflected = matches!(from_udp_port, 53 | 443 | 51820);
+            //let is_global = crate::ip::is_global(&from_ip_addr);
+            let is_global = false;
 
-                    info!("processing connection sends");
-                    // Process outgoing packets.
-                    match conn.send(&mut buf) {
-                        Ok((write, send_info)) => {
-                            info!("sending {} bytes to {:?}", write, send_info.to);
-                            // Send the payload back to the source.
-                            match socket.send_to(&out[..write], &send_info.to) {
-                                Ok(_) => {
-                                    counters.send += 1;
-                                }
-                                Err(e) => {
-                                    counters.send_errors += 1;
-                                }
-                            }
-                        }
-                        Err(quiche::Error::Done) => {}
-                        Err(e) => {
-                            info!("conn send error? {:?}", e);
-                            counters.connection_send_errors += 1;
-                        }
-                    }
-                }
-                connections.retain(|_, ref mut c| {
-                    if c.is_closed() {
-                        info!("connection closed: {:?}", c.destination_id());
-                    }
-                    !c.is_closed()
-                });
+            if is_reflected || is_global {
+                self.metrics.rx_pkt_drop_martian_cnt.fetch_add(1, Relaxed);
+                continue;
             }
-        })
-        .unwrap();
 
-    Ok(SpawnServerResult { thread })
+            // Parse the QUIC packet's header.
+            let hdr = match quiche::Header::from_slice(packet.buffer_mut(), 8) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                    continue 'triage;
+                }
+            };
+
+            // Does a connection exist for that ICID?
+            let icid: Option<ICID> = {
+                let dcid_bytes: &[u8] = hdr.dcid.as_ref();
+                let dcid = dcid_bytes.try_into().ok().map(u64::from_le_bytes);
+                dcid.and_then(|v| self.conn_ids.get(&v).copied())
+            };
+
+            match (hdr.ty, icid) {
+                (quiche::Type::Initial, None) => {
+                    // Statelessly process connection requests
+                    self.q_initial.push(pkt_idx as u16);
+                    continue 'triage;
+                }
+                // Packet pertains to some known conenction
+                (quiche::Type::Short, Some(icid)) => {
+                    self.q_established.push((pkt_idx as u16, icid))
+                }
+                (_, Some(icid)) => self.q_handshake.push((pkt_idx as u16, icid)),
+                (_, None) => {
+                    self.metrics.rx_pkt_drop_unknown_cnt.fetch_add(1, Relaxed);
+                    continue 'triage;
+                }
+            };
+        }
+
+        // Handle packets relating to established conns first, then
+        // process handshaking
+        'known: for (pkt_idx, icid) in self
+            .q_established
+            .drain(..)
+            .chain(self.q_handshake.drain(..))
+        {
+            let packet = &mut self.packet_batch.borrow_mut()[pkt_idx as usize];
+
+            let conn = match self.conns.get_mut(&icid) {
+                Some(conn) => conn,
+                None => {
+                    // This should never happen
+                    self.conn_ids.remove(&icid);
+                    self.metrics.rx_pkt_drop_unknown_cnt.fetch_add(1, Relaxed);
+                    continue 'known;
+                }
+            };
+
+            // Upgrade reference to static lifetime to allow multiple
+            // mutable borrows on the HashMap.  Assumes that conn is
+            // not dropped from the hashmap in this scope.  Assumes that
+            // this reference does not escape this scope.
+            let conn = unsafe { (conn as *mut Conn).as_mut::<'static>().unwrap() };
+
+            // TODO handle conn packet
+            let quiche_conn = conn.conn.as_mut().unwrap();
+            let from = packet.meta().socket_addr();
+            match quiche_conn.recv(
+                packet.buffer_mut(),
+                quiche::RecvInfo {
+                    from,
+                    to: self.local_addr,
+                },
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                    continue 'known;
+                }
+            };
+
+            Self::update_scids(icid, quiche_conn, &mut self.conn_ids, &mut self.rng);
+            self.pending_conns.push(icid);
+
+            for stream_id in quiche_conn.readable() {
+                // Allocate the oldest slot
+                let reasm_id = (icid, stream_id);
+                let (reasm_slot, evicted_slot) = self.reasm.acquire(reasm_id);
+
+                // If the oldest slot is still occupied, free it.
+                if let Some((evictee_icid, evictee_stream_id)) = evicted_slot {
+                    // Make sure that the stream associated with this
+                    // slot gets destroyed to prevent it from reclaiming
+                    // a new slot.
+                    if let Some(evictee_conn) = self.conns.get_mut(&evictee_icid) {
+                        let _ = evictee_conn.conn.as_mut().unwrap().stream_shutdown(
+                            evictee_stream_id,
+                            quiche::Shutdown::Read,
+                            0,
+                        );
+                        self.metrics.tpu_txn_drop_cnt.fetch_add(1, Relaxed);
+                    }
+                }
+
+                // Read stream fragments into the newly allocated slot.
+                let mut stream_buf = [0u8; 4096];
+                'stream: while let Ok((read, fin)) =
+                    quiche_conn.stream_recv(stream_id, &mut stream_buf)
+                {
+                    if !reasm_slot.append(&stream_buf[..read]) {
+                        // Transaction too large or too fragmented.
+                        // TODO Consider stronger punishment.
+                        let _data = self.reasm.finish(reasm_id);
+                        let _ = quiche_conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                        self.metrics.tpu_txn_drop_cnt.fetch_add(1, Relaxed);
+                        self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                        continue 'known; // ignore rest of packet
+                    }
+                    if fin {
+                        // Transaction reassembled successfully.
+                        // Free the slot.
+                        let _data = self.reasm.finish(reasm_id);
+                        self.metrics.tpu_txn_cnt.fetch_add(1, Relaxed);
+                        // TODO handle data
+                        break 'stream;
+                    }
+                }
+            }
+        }
+
+        // Handle packets relating to connection requests
+        'initial: for pkt_idx in self.q_initial.drain(..) {
+            let mut pb = self.packet_batch.borrow_mut();
+            let packet = &mut pb[pkt_idx as usize];
+
+            // Re-parse the packet header (TODO consider buffering)
+            let hdr = quiche::Header::from_slice(packet.buffer_mut(), 8).unwrap();
+            if hdr.ty != quiche::Type::Initial {
+                self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                continue 'initial;
+            }
+
+            if !quiche::version_is_supported(hdr.version) {
+                self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                continue 'initial;
+            }
+
+            self.next_icid += 1;
+            let new_icid = self.next_icid;
+
+            let new_dcid_u: u64 = self.rng.gen();
+            let new_dcid_b = new_dcid_u.to_le_bytes();
+            let new_dcid = ConnectionId::from_ref(&new_dcid_b[..]);
+            let quiche_conn = quiche::accept(
+                &new_dcid,
+                None,
+                self.local_addr,
+                packet.meta().socket_addr(),
+                &mut self.quiche_cfg,
+            )
+            .unwrap();
+            let mut conn = Conn {
+                conn: Some(quiche_conn), // expensive copy :(
+            };
+            let quiche_conn = conn.conn.as_mut().unwrap();
+
+            // Handle coalesced packet content
+            let from = packet.meta().socket_addr();
+            match quiche_conn.recv(
+                packet.buffer_mut(),
+                quiche::RecvInfo {
+                    from,
+                    to: self.local_addr,
+                },
+            ) {
+                Ok(v) => v,
+                Err(_err) => {
+                    self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                    continue 'initial;
+                }
+            };
+
+            self.conn_ids.insert(new_dcid_u as SCID, new_icid as ICID);
+            Self::update_scids(new_icid, quiche_conn, &mut self.conn_ids, &mut self.rng);
+            self.conns.insert(new_icid, conn);
+
+            self.pending_conns.push(new_icid);
+            self.metrics.quic_accept_cnt.fetch_add(1, Relaxed);
+        }
+
+        // At this point, we read all incoming packets.
+        // We can now reuse our receive buffer for sending.
+        //self.packet_batch.truncate(0);
+
+        // We assume that we won't ever generate more outgoing packets
+        // than there are incoming packets.  (This is a reasonable
+        // assumption because the TPU server has no outgoing traffic
+        // other than QUIC mgmt things and ACKs)
+        let mut send_pkt_cnt = 0usize;
+        'respond: for icid in self.pending_conns.drain() {
+            let conn = match self.conns.get_mut(&icid) {
+                Some(conn) => conn,
+                None => {
+                    self.conn_ids.remove(&icid);
+                    continue 'respond;
+                }
+            };
+            let conn = conn.conn.as_mut().unwrap();
+
+            let mut index = 0;
+            'genpkt: loop {
+                if send_pkt_cnt >= EVENT_CNT {
+                    break 'respond;
+                }
+                let mut pb = self.packet_batch.borrow_mut();
+                let buf = pb[index].buffer_mut();
+                match conn.send(&mut buf[..]) {
+                    Ok((out_len, send_info)) => {
+                        pb[index].meta_mut().size = out_len;
+                        pb[index].meta_mut().set_socket_addr(&send_info.to);
+                    }
+                    Err(quiche::Error::Done) => break 'genpkt,
+                    Err(err) => panic!("send failed {}", err),
+                };
+                index += 1;
+            }
+            let pb = self.packet_batch.borrow();
+            let packets_and_senders: Vec<_> = (0..index)
+                .into_iter()
+                .map(|i| (pb[i].data(..).unwrap(), pb[i].meta().socket_addr()))
+                .collect();
+            match crate::sendmmsg::batch_send(&self.socket, &packets_and_senders) {
+                Ok(num_packets) => {
+                    info!("sent {:?}", num_packets);
+                }
+                Err(e) => {
+                    info!("Error: {:?}", e);
+                }
+            }
+
+            send_pkt_cnt += 1;
+        }
+
+        if send_pkt_cnt == 0 {
+            return; // nothing to do
+        }
+
+        /*match batch_send() {
+            Err(e) => {
+            },
+            Ok(s) => {
+                if s < pkt_cnt {
+                    self.metrics
+                        .tx_drop_cnt
+                        .fetch_add(send_pkt_cnt as u64 - msg_cnt_s as u64, Relaxed);
+                } else {
+                    self.metrics.tx_pkt_cnt.fetch_add(msg_cnt_s as u64, Relaxed);
+                }
+            }
+        }*/
+    }
+
+    fn update_scids(
+        icid: ICID,
+        conn: &mut quiche::Connection,
+        conn_ids: &mut HashMap<SCID, ICID>,
+        rng: &mut SmallRng,
+    ) {
+        // Remove retired SCIDs
+        while let Some(retired_scid) = conn.retired_scid_next() {
+            if let Some(scid) = parse_scid(&retired_scid) {
+                conn_ids.remove(&scid);
+            }
+        }
+        // Provide new SCIDs
+        while conn.scids_left() > 0 {
+            let scid_u: u64 = rng.gen();
+            let scid_b = scid_u.to_le_bytes();
+            let scid = ConnectionId::from_ref(&scid_b[..]);
+            let reset_token: u128 = rng.gen();
+            match conn.new_scid(&scid, reset_token, false) {
+                Ok(_) => (),
+                Err(quiche::Error::InvalidState) => continue, // already used
+                Err(err) => panic!("Unexpected failure providing SCID: {}", err),
+            };
+            conn_ids.insert(scid_u as SCID, icid);
+        }
+    }
+}
+
+pub type ICID = u64;
+pub type SCID = u64;
+
+fn parse_scid(id: &ConnectionId) -> Option<u64> {
+    let bytes = id.as_ref();
+    if bytes.len() != 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+pub struct Server {
+    pub metrics: Vec<Arc<ServerMetrics>>,
+    tiles: Vec<ServerTile>,
+    thread_handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+pub struct ServerConfig {
+    pub tile_count: usize,
+    pub listen_addr: SocketAddr,
+    pub max_connections: usize,
+}
+
+impl Server {
+    pub fn new(
+        config: &ServerConfig,
+        keypair: &Keypair,
+        sockets: Vec<UdpSocket>,
+    ) -> Result<Self, std::io::Error> {
+        let tiles = sockets
+            .into_iter()
+            .map(|s| ServerTile::new(s, config.listen_addr, keypair, config.max_connections))
+            .collect::<Vec<ServerTile>>();
+        let metrics = tiles.iter().map(|tile| tile.metrics()).collect();
+
+        Ok(Self {
+            thread_handles: Vec::with_capacity(tiles.len()),
+            metrics,
+            tiles,
+        })
+    }
+
+    pub fn start(&mut self) {
+        let tiles = std::mem::take(&mut self.tiles);
+        tiles
+            .into_iter()
+            .map(|mut tile| {
+                std::thread::spawn(move || {
+                    tile.run();
+                })
+            })
+            .for_each(|hdl| self.thread_handles.push(hdl));
+    }
+
+    pub fn wait(&mut self) {
+        self.thread_handles
+            .drain(..)
+            .for_each(|hdl| hdl.join().expect("Failed to join thread"));
+    }
+}
+
+// This poor thing is ~20 kB.
+pub struct Conn {
+    pub conn: Option<quiche::Connection>,
 }
 
 #[cfg(test)]
