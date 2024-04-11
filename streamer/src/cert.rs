@@ -1,4 +1,4 @@
-use ed25519_dalek::Keypair;
+use solana_sdk::signature::{Keypair, Signer};
 
 pub fn new_dummy_x509_certificate(keypair: &Keypair) -> (Vec<u8>, Vec<u8>) {
     // Unfortunately, rustls does not accept a "raw" Ed25519 key.
@@ -21,7 +21,7 @@ pub fn new_dummy_x509_certificate(keypair: &Keypair) -> (Vec<u8>, Vec<u8>) {
     ];
     let mut key_pkcs8_der = Vec::<u8>::with_capacity(PKCS8_PREFIX.len() + 32);
     key_pkcs8_der.extend_from_slice(&PKCS8_PREFIX);
-    key_pkcs8_der.extend_from_slice(keypair.secret.as_bytes());
+    key_pkcs8_der.extend_from_slice(&keypair.secret().to_bytes());
 
     // Create a dummy certificate. Only the SubjectPublicKeyInfo field
     // is relevant to the peer-to-peer protocols. The signature of the
@@ -59,7 +59,7 @@ pub fn new_dummy_x509_certificate(keypair: &Keypair) -> (Vec<u8>, Vec<u8>) {
         0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a, 0x30, 0x00, 0x30, 0x2a,
         0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ]);
-    cert_der.extend_from_slice(keypair.public.as_bytes());
+    cert_der.extend_from_slice(&keypair.pubkey().to_bytes());
     //        extensions [3] (1 elem)
     //          Extensions SEQUENCE (2 elem)
     //            Extension SEQUENCE (3 elem)

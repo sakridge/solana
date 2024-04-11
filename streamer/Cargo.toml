@@ -25,8 +25,8 @@ nix = { workspace = true, features = ["net"] }
 pem = { workspace = true }
 percentage = { workspace = true }
 quiche = { version = "0.20.1", features = ["boringssl-boring-crate"] }
-quinn = { workspace = true }
-quinn-proto = { workspace = true }
+quinn = { path = "../../quinn/quinn", version = "0.10.0" }
+quinn-proto = { path = "../../quinn/quinn-proto", version = "0.10.0" }
 rand = { workspace = true }
 ring = "0.17.8"
 rustls = { workspace = true, features = ["dangerous_configuration"] }

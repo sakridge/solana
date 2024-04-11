@@ -1,5 +1,6 @@
 use {
     crate::quic_quiche::ICID,
+    solana_perf::packet::{Packet, PacketBatch},
     std::collections::{hash_map::Entry, HashMap},
 };
 
@@ -16,15 +17,17 @@ pub(crate) enum ReasmState {
 pub(crate) struct ReasmSlot {
     state: ReasmState,
     pub(crate) sz: u16,
-    pub(crate) data: [u8; crate::buf::TXN_MAX_SZ],
+    pub(crate) data: PacketBatch,
     pub(crate) frag_cnt: u8, // Used to prevent slowloris attacks
 }
 
 impl Default for ReasmSlot {
     fn default() -> Self {
+        let mut data = PacketBatch::with_capacity(1);
+        data.resize(1, Packet::default());
         Self {
             state: ReasmState::Free,
-            data: [0; crate::buf::TXN_MAX_SZ],
+            data,
             sz: 0,
             frag_cnt: 0,
         }
@@ -35,11 +38,18 @@ impl ReasmSlot {
     pub(crate) fn append(&mut self, data: &[u8]) -> bool {
         self.frag_cnt += 1;
         if self.frag_cnt as usize > crate::buf::TXN_MAX_FRAGS {
+            info!("bad frags? {}", self.frag_cnt);
             return false;
         }
+        info!(
+            "new_sz {} data: {} max: {}",
+            self.sz,
+            data.len(),
+            crate::buf::TXN_MAX_SZ
+        );
         let new_sz = self.sz + data.len() as u16;
         if new_sz <= crate::buf::TXN_MAX_SZ as u16 {
-            self.data[self.sz as usize..new_sz as usize].copy_from_slice(data);
+            self.data[0].buffer_mut()[self.sz as usize..new_sz as usize].copy_from_slice(data);
             self.sz = new_sz;
             true
         } else {
@@ -94,7 +104,7 @@ impl Reasm {
         (next_slot, evicted_id)
     }
 
-    pub(crate) fn finish(&mut self, id: ReasmID) {
+    pub(crate) fn finish(&mut self, id: ReasmID) -> PacketBatch {
         let slot_idx = self.by_stream.remove(&id).unwrap() as usize;
         let slot = &mut self.slots[slot_idx];
         if let ReasmState::Busy(reasm_id) = slot.state {
@@ -102,5 +112,8 @@ impl Reasm {
             self.by_stream.remove(&reasm_id);
         }
         slot.state = ReasmState::Pub;
+        let mut ret = std::mem::replace(&mut slot.data, PacketBatch::default());
+        ret[0].meta_mut().size = slot.sz as usize;
+        ret
     }
 }

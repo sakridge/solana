@@ -36,6 +36,7 @@ pub fn recv_from(batch: &mut PacketBatch, socket: &UdpSocket, max_wait: Duration
         match recv_mmsg(socket, &mut batch[i..]) {
             Err(_) if i > 0 => {
                 if start.elapsed() > max_wait {
+                    info!("timeout with {} packets", i);
                     break;
                 }
             }
@@ -44,10 +45,10 @@ pub fn recv_from(batch: &mut PacketBatch, socket: &UdpSocket, max_wait: Duration
                 return Err(e);
             }
             Ok(npkts) => {
+                trace!("got {} packets", npkts);
                 if i == 0 {
                     socket.set_nonblocking(true)?;
                 }
-                trace!("got {} packets", npkts);
                 i += npkts;
                 // Try to batch into big enough buffers
                 // will cause less re-shuffling later on.

@@ -1470,10 +1470,12 @@ pub mod test {
         let num_bytes = PACKET_DATA_SIZE;
         let num_expected_packets = 1;
         let mut s1 = conn1.open_uni().await.unwrap();
+        info!("opened connection: {:?}", s1);
         for _ in 0..num_bytes {
             s1.write_all(&[0u8]).await.unwrap();
         }
         s1.finish().await.unwrap();
+        info!("done writing streams: {:?}", num_bytes);
 
         let mut all_packets = vec![];
         let now = Instant::now();

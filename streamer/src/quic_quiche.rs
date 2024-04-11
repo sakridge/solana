@@ -2,14 +2,16 @@ use {
     crate::{
         buf::{EVENT_CNT, REASM_DEPTH},
         metrics::ServerMetrics,
+        quic::{QuicServer, QuicServerError},
         reasm::Reasm,
+        streamer::StakedNodes,
     },
     boring::{
         pkey::PKey,
         ssl::{SslContextBuilder, SslMethod, SslVersion},
         x509::X509,
     },
-    ed25519_dalek::Keypair,
+    crossbeam_channel::Sender,
     quiche::ConnectionId,
     rand::{
         rngs::{OsRng, SmallRng},
@@ -17,11 +19,15 @@ use {
     },
     siphasher::sip::SipHasher24,
     solana_perf::packet::PacketBatch,
+    solana_sdk::{packet::Packet, signature::Keypair},
     std::{
         cell::RefCell,
         collections::{BinaryHeap, HashMap},
         net::{SocketAddr, UdpSocket},
-        sync::{atomic::Ordering::Relaxed, Arc},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, RwLock,
+        },
         time::Duration,
     },
 };
@@ -50,6 +56,8 @@ pub struct ServerTile {
 
     // Reassembler for fragmented transaction data
     reasm: Reasm,
+    exit: Arc<AtomicBool>,
+    packet_sender: Sender<PacketBatch>,
 }
 
 impl ServerTile {
@@ -58,7 +66,10 @@ impl ServerTile {
         local_addr: SocketAddr,
         keypair: &Keypair,
         max_connections: usize,
+        exit: Arc<AtomicBool>,
+        packet_sender: Sender<PacketBatch>,
     ) -> Self {
+        info!("new tile! {:?}", local_addr);
         let conns = HashMap::with_capacity(max_connections);
         let conn_ids = HashMap::with_capacity(max_connections * 4);
 
@@ -84,7 +95,7 @@ impl ServerTile {
         quiche_cfg.set_initial_max_stream_data_uni(crate::buf::TXN_MAX_SZ as u64);
         quiche_cfg.set_max_idle_timeout(3000u64);
 
-        let packet_batch = RefCell::new(PacketBatch::default());
+        let packet_batch = RefCell::new(PacketBatch::with_capacity(128));
 
         Self {
             local_addr,
@@ -103,6 +114,8 @@ impl ServerTile {
             pending_conns: BinaryHeap::with_capacity(EVENT_CNT),
             retry_signer: SipHasher24::new_with_keys(OsRng.next_u64(), OsRng.next_u64()),
             reasm: Reasm::new(REASM_DEPTH),
+            exit,
+            packet_sender,
         }
     }
 
@@ -111,7 +124,8 @@ impl ServerTile {
     }
 
     pub fn run(&mut self) {
-        loop {
+        info!("Run!");
+        while !self.exit.load(Ordering::Relaxed) {
             self.poll();
         }
     }
@@ -124,16 +138,20 @@ impl ServerTile {
 
         // TODO timeout management
 
-        let packet_count = crate::packet::recv_from(
-            &mut self.packet_batch.borrow_mut(),
-            &self.socket,
-            Duration::from_millis(100),
-        )
-        .unwrap_or(0);
+        info!("receiving.. connections: {}", self.conns.len());
+        let packet_count = {
+            let mut pb = &mut self.packet_batch.borrow_mut();
+            /*for p in pb.packets {
+                p.meta.reset();
+            }*/
+            pb.truncate(0);
+            crate::packet::recv_from(&mut pb, &self.socket, Duration::from_millis(10)).unwrap_or(0)
+        };
+        info!("packets {}", packet_count);
 
         self.metrics
             .rx_pkt_cnt
-            .fetch_add(packet_count as u64, Relaxed);
+            .fetch_add(packet_count as u64, Ordering::Relaxed);
 
         // Triage packets, sorting them into different QoS classes
         'triage: for pkt_idx in 0..packet_count {
@@ -149,15 +167,24 @@ impl ServerTile {
             let is_global = false;
 
             if is_reflected || is_global {
-                self.metrics.rx_pkt_drop_martian_cnt.fetch_add(1, Relaxed);
+                self.metrics
+                    .rx_pkt_drop_martian_cnt
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
             // Parse the QUIC packet's header.
-            let hdr = match quiche::Header::from_slice(packet.buffer_mut(), 8) {
-                Ok(v) => v,
-                Err(_) => {
-                    self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+            let packet_size = packet.meta().size;
+            let hdr = match quiche::Header::from_slice(&mut packet.buffer_mut()[..packet_size], 8) {
+                Ok(v) => {
+                    info!("good quic header! {:?}", v);
+                    v
+                }
+                Err(e) => {
+                    info!("bad quic header! {:?}", e);
+                    self.metrics
+                        .rx_pkt_drop_garbage_cnt
+                        .fetch_add(1, Ordering::Relaxed);
                     continue 'triage;
                 }
             };
@@ -172,6 +199,7 @@ impl ServerTile {
             match (hdr.ty, icid) {
                 (quiche::Type::Initial, None) => {
                     // Statelessly process connection requests
+                    info!("initial packet: {}", pkt_idx);
                     self.q_initial.push(pkt_idx as u16);
                     continue 'triage;
                 }
@@ -181,11 +209,18 @@ impl ServerTile {
                 }
                 (_, Some(icid)) => self.q_handshake.push((pkt_idx as u16, icid)),
                 (_, None) => {
-                    self.metrics.rx_pkt_drop_unknown_cnt.fetch_add(1, Relaxed);
+                    self.metrics
+                        .rx_pkt_drop_unknown_cnt
+                        .fetch_add(1, Ordering::Relaxed);
                     continue 'triage;
                 }
             };
         }
+
+        info!(
+            "handling established: {:?} handshakes: {:?}",
+            self.q_established, self.q_handshake
+        );
 
         // Handle packets relating to established conns first, then
         // process handshaking
@@ -194,14 +229,21 @@ impl ServerTile {
             .drain(..)
             .chain(self.q_handshake.drain(..))
         {
+            info!("handling known {}", pkt_idx);
+
             let packet = &mut self.packet_batch.borrow_mut()[pkt_idx as usize];
 
             let conn = match self.conns.get_mut(&icid) {
-                Some(conn) => conn,
+                Some(conn) => {
+                    info!("found connection for packet: {}", pkt_idx);
+                    conn
+                }
                 None => {
                     // This should never happen
                     self.conn_ids.remove(&icid);
-                    self.metrics.rx_pkt_drop_unknown_cnt.fetch_add(1, Relaxed);
+                    self.metrics
+                        .rx_pkt_drop_unknown_cnt
+                        .fetch_add(1, Ordering::Relaxed);
                     continue 'known;
                 }
             };
@@ -215,16 +257,22 @@ impl ServerTile {
             // TODO handle conn packet
             let quiche_conn = conn.conn.as_mut().unwrap();
             let from = packet.meta().socket_addr();
+            let packet_size = packet.meta().size;
             match quiche_conn.recv(
-                packet.buffer_mut(),
+                &mut packet.buffer_mut()[..packet_size],
                 quiche::RecvInfo {
                     from,
                     to: self.local_addr,
                 },
             ) {
-                Ok(v) => v,
+                Ok(v) => {
+                    info!("recv?: {}", v);
+                    v
+                }
                 Err(_) => {
-                    self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                    self.metrics
+                        .rx_pkt_drop_garbage_cnt
+                        .fetch_add(1, Ordering::Relaxed);
                     continue 'known;
                 }
             };
@@ -248,7 +296,9 @@ impl ServerTile {
                             quiche::Shutdown::Read,
                             0,
                         );
-                        self.metrics.tpu_txn_drop_cnt.fetch_add(1, Relaxed);
+                        self.metrics
+                            .tpu_txn_drop_cnt
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
@@ -257,21 +307,31 @@ impl ServerTile {
                 'stream: while let Ok((read, fin)) =
                     quiche_conn.stream_recv(stream_id, &mut stream_buf)
                 {
+                    info!("received {} stream bytes fin?: {}", read, fin);
                     if !reasm_slot.append(&stream_buf[..read]) {
+                        info!("bad reasm?");
                         // Transaction too large or too fragmented.
                         // TODO Consider stronger punishment.
                         let _data = self.reasm.finish(reasm_id);
                         let _ = quiche_conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
-                        self.metrics.tpu_txn_drop_cnt.fetch_add(1, Relaxed);
-                        self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                        self.metrics
+                            .tpu_txn_drop_cnt
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .rx_pkt_drop_garbage_cnt
+                            .fetch_add(1, Ordering::Relaxed);
                         continue 'known; // ignore rest of packet
                     }
                     if fin {
                         // Transaction reassembled successfully.
                         // Free the slot.
-                        let _data = self.reasm.finish(reasm_id);
-                        self.metrics.tpu_txn_cnt.fetch_add(1, Relaxed);
+                        info!("finish.. {:?}", reasm_id);
+                        let data = self.reasm.finish(reasm_id);
+                        self.metrics.tpu_txn_cnt.fetch_add(1, Ordering::Relaxed);
                         // TODO handle data
+                        if let Err(e) = self.packet_sender.send(data) {
+                            info!("Packet send error? {:?}", e);
+                        }
                         break 'stream;
                     }
                 }
@@ -280,18 +340,27 @@ impl ServerTile {
 
         // Handle packets relating to connection requests
         'initial: for pkt_idx in self.q_initial.drain(..) {
+            info!("handling init: {:?}", pkt_idx);
             let mut pb = self.packet_batch.borrow_mut();
             let packet = &mut pb[pkt_idx as usize];
 
             // Re-parse the packet header (TODO consider buffering)
-            let hdr = quiche::Header::from_slice(packet.buffer_mut(), 8).unwrap();
+            let packet_size = packet.meta().size;
+            let hdr =
+                quiche::Header::from_slice(&mut packet.buffer_mut()[..packet_size], 8).unwrap();
             if hdr.ty != quiche::Type::Initial {
-                self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                info!("bad initial?");
+                self.metrics
+                    .rx_pkt_drop_garbage_cnt
+                    .fetch_add(1, Ordering::Relaxed);
                 continue 'initial;
             }
 
             if !quiche::version_is_supported(hdr.version) {
-                self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                info!("version not supported? {}", hdr.version);
+                self.metrics
+                    .rx_pkt_drop_garbage_cnt
+                    .fetch_add(1, Ordering::Relaxed);
                 continue 'initial;
             }
 
@@ -301,6 +370,7 @@ impl ServerTile {
             let new_dcid_u: u64 = self.rng.gen();
             let new_dcid_b = new_dcid_u.to_le_bytes();
             let new_dcid = ConnectionId::from_ref(&new_dcid_b[..]);
+            info!("accepting..?");
             let quiche_conn = quiche::accept(
                 &new_dcid,
                 None,
@@ -317,15 +387,21 @@ impl ServerTile {
             // Handle coalesced packet content
             let from = packet.meta().socket_addr();
             match quiche_conn.recv(
-                packet.buffer_mut(),
+                &mut packet.buffer_mut()[..packet_size],
                 quiche::RecvInfo {
                     from,
                     to: self.local_addr,
                 },
             ) {
-                Ok(v) => v,
-                Err(_err) => {
-                    self.metrics.rx_pkt_drop_garbage_cnt.fetch_add(1, Relaxed);
+                Ok(v) => {
+                    info!("recv: {:?}", v);
+                    v
+                }
+                Err(err) => {
+                    info!("recv error: {:?}", err);
+                    self.metrics
+                        .rx_pkt_drop_garbage_cnt
+                        .fetch_add(1, Ordering::Relaxed);
                     continue 'initial;
                 }
             };
@@ -335,7 +411,7 @@ impl ServerTile {
             self.conns.insert(new_icid, conn);
 
             self.pending_conns.push(new_icid);
-            self.metrics.quic_accept_cnt.fetch_add(1, Relaxed);
+            self.metrics.quic_accept_cnt.fetch_add(1, Ordering::Relaxed);
         }
 
         // At this point, we read all incoming packets.
@@ -360,39 +436,60 @@ impl ServerTile {
             let mut index = 0;
             'genpkt: loop {
                 if send_pkt_cnt >= EVENT_CNT {
+                    info!("send packet count {} {}", send_pkt_cnt, EVENT_CNT);
                     break 'respond;
                 }
                 let mut pb = self.packet_batch.borrow_mut();
+                if index >= pb.len() {
+                    pb.resize(index + 1, Packet::default());
+                }
                 let buf = pb[index].buffer_mut();
                 match conn.send(&mut buf[..]) {
                     Ok((out_len, send_info)) => {
+                        info!("generating packet {} {:?}", out_len, send_info.to);
                         pb[index].meta_mut().size = out_len;
                         pb[index].meta_mut().set_socket_addr(&send_info.to);
                     }
-                    Err(quiche::Error::Done) => break 'genpkt,
+                    Err(quiche::Error::Done) => {
+                        info!("done sending.. {} index: {}", send_pkt_cnt, index);
+                        break 'genpkt;
+                    }
                     Err(err) => panic!("send failed {}", err),
                 };
                 index += 1;
             }
-            let pb = self.packet_batch.borrow();
-            let packets_and_senders: Vec<_> = (0..index)
-                .into_iter()
-                .map(|i| (pb[i].data(..).unwrap(), pb[i].meta().socket_addr()))
-                .collect();
-            match crate::sendmmsg::batch_send(&self.socket, &packets_and_senders) {
-                Ok(num_packets) => {
-                    info!("sent {:?}", num_packets);
-                }
-                Err(e) => {
-                    info!("Error: {:?}", e);
-                }
-            }
 
-            send_pkt_cnt += 1;
+            send_pkt_cnt += index;
         }
 
+        info!("send_pkt_cnt: {}", send_pkt_cnt);
         if send_pkt_cnt == 0 {
             return; // nothing to do
+        }
+
+        let pb = self.packet_batch.borrow();
+        let packets_and_senders: Vec<_> = (0..send_pkt_cnt)
+            .into_iter()
+            .map(|i| {
+                info!(
+                    "sending: {} to {}",
+                    pb[i].meta().size,
+                    pb[i].meta().socket_addr()
+                );
+                (
+                    pb[i].data(..pb[i].meta().size).unwrap(),
+                    pb[i].meta().socket_addr(),
+                )
+            })
+            .collect();
+        info!("sending {}", packets_and_senders.len());
+        match crate::sendmmsg::batch_send(&self.socket, &packets_and_senders) {
+            Ok(_) => {
+                info!("sent {:?}", packets_and_senders.len());
+            }
+            Err(e) => {
+                info!("Error: {:?}", e);
+            }
         }
 
         /*match batch_send() {
@@ -402,9 +499,9 @@ impl ServerTile {
                 if s < pkt_cnt {
                     self.metrics
                         .tx_drop_cnt
-                        .fetch_add(send_pkt_cnt as u64 - msg_cnt_s as u64, Relaxed);
+                        .fetch_add(send_pkt_cnt as u64 - msg_cnt_s as u64, Ordering::Relaxed);
                 } else {
-                    self.metrics.tx_pkt_cnt.fetch_add(msg_cnt_s as u64, Relaxed);
+                    self.metrics.tx_pkt_cnt.fetch_add(msg_cnt_s as u64, Ordering::Relaxed);
                 }
             }
         }*/
@@ -452,7 +549,7 @@ fn parse_scid(id: &ConnectionId) -> Option<u64> {
 pub struct Server {
     pub metrics: Vec<Arc<ServerMetrics>>,
     tiles: Vec<ServerTile>,
-    thread_handles: Vec<std::thread::JoinHandle<()>>,
+    thread_handles: RefCell<Vec<std::thread::JoinHandle<()>>>,
 }
 
 pub struct ServerConfig {
@@ -461,26 +558,47 @@ pub struct ServerConfig {
     pub max_connections: usize,
 }
 
+impl QuicServer for Server {
+    fn join(&self) -> Option<()> {
+        self.thread_handles.borrow_mut().drain(..).for_each(|t| {
+            t.join().unwrap();
+        });
+        Some(())
+    }
+}
+
 impl Server {
     pub fn new(
         config: &ServerConfig,
         keypair: &Keypair,
         sockets: Vec<UdpSocket>,
+        exit: Arc<AtomicBool>,
+        packet_sender: Sender<PacketBatch>,
     ) -> Result<Self, std::io::Error> {
         let tiles = sockets
             .into_iter()
-            .map(|s| ServerTile::new(s, config.listen_addr, keypair, config.max_connections))
+            .map(|s| {
+                ServerTile::new(
+                    s,
+                    config.listen_addr,
+                    keypair,
+                    config.max_connections,
+                    exit.clone(),
+                    packet_sender.clone(),
+                )
+            })
             .collect::<Vec<ServerTile>>();
         let metrics = tiles.iter().map(|tile| tile.metrics()).collect();
 
         Ok(Self {
-            thread_handles: Vec::with_capacity(tiles.len()),
+            thread_handles: RefCell::new(Vec::with_capacity(tiles.len())),
             metrics,
             tiles,
         })
     }
 
     pub fn start(&mut self) {
+        info!("start!");
         let tiles = std::mem::take(&mut self.tiles);
         tiles
             .into_iter()
@@ -489,11 +607,12 @@ impl Server {
                     tile.run();
                 })
             })
-            .for_each(|hdl| self.thread_handles.push(hdl));
+            .for_each(|hdl| self.thread_handles.borrow_mut().push(hdl));
     }
 
     pub fn wait(&mut self) {
         self.thread_handles
+            .borrow_mut()
             .drain(..)
             .for_each(|hdl| hdl.join().expect("Failed to join thread"));
     }
@@ -504,14 +623,44 @@ pub struct Conn {
     pub conn: Option<quiche::Connection>,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_server(
+    thread_name: &'static str,
+    metrics_name: &'static str,
+    sock: UdpSocket,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    exit: Arc<AtomicBool>,
+    max_connections_per_peer: usize,
+    staked_nodes: Arc<RwLock<StakedNodes>>,
+    max_staked_connections: usize,
+    max_unstaked_connections: usize,
+    wait_for_chunk_timeout: Duration,
+    coalesce: Duration,
+) -> Result<Box<dyn QuicServer>, QuicServerError> {
+    let config = ServerConfig {
+        tile_count: 1,
+        listen_addr: "0.0.0.0:0".parse().unwrap(),
+        max_connections: max_staked_connections,
+    };
+    let mut s = Server::new(&config, keypair, vec![sock], exit, packet_sender)
+        .map_err(|_e| QuicServerError::Failed)?;
+    s.start();
+    Ok(Box::new(s))
+}
+
 #[cfg(test)]
 mod test {
     use {
         super::*,
-        crate::nonblocking::quic::{test::*, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT},
+        crate::{
+            nonblocking::quic::{test::*, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT},
+            quic::{MAX_STAKED_CONNECTIONS, MAX_UNSTAKED_CONNECTIONS},
+        },
         crossbeam_channel::unbounded,
         solana_sdk::net::DEFAULT_TPU_COALESCE,
-        std::net::SocketAddr,
+        std::{net::SocketAddr, sync::RwLock},
+        tokio::runtime::Runtime,
     };
 
     fn rt(name: String) -> Runtime {
@@ -523,7 +672,7 @@ mod test {
     }
 
     fn setup_quic_server() -> (
-        std::thread::JoinHandle<()>,
+        Box<dyn QuicServer>,
         Arc<AtomicBool>,
         crossbeam_channel::Receiver<PacketBatch>,
         SocketAddr,
@@ -534,7 +683,7 @@ mod test {
         let keypair = Keypair::new();
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
-        let SpawnServerResult { thread: t } = spawn_server(
+        let quic_server = spawn_server(
             "solQuicTest",
             "quic_streamer_test",
             s,
@@ -549,7 +698,7 @@ mod test {
             DEFAULT_TPU_COALESCE,
         )
         .unwrap();
-        (t, exit, receiver, server_address)
+        (quic_server, exit, receiver, server_address)
     }
 
     #[test]
@@ -589,7 +738,7 @@ mod test {
         let keypair = Keypair::new();
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
-        let SpawnServerResult { thread: t } = spawn_server(
+        let quic_server = spawn_server(
             "solQuicTest",
             "quic_streamer_test",
             s,
@@ -608,7 +757,7 @@ mod test {
         let runtime = rt("solQuicTestRt".to_string());
         runtime.block_on(check_multiple_streams(receiver, server_address));
         exit.store(true, Ordering::Relaxed);
-        t.join().unwrap();
+        quic_server.join().unwrap();
     }
 
     #[test]
@@ -631,7 +780,7 @@ mod test {
         let keypair = Keypair::new();
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
-        let SpawnServerResult { thread: t } = spawn_server(
+        let quic_server = spawn_server(
             "solQuicTest",
             "quic_streamer_test",
             s,
@@ -650,6 +799,6 @@ mod test {
         let runtime = rt("solQuicTestRt".to_string());
         runtime.block_on(check_unstaked_node_connect_failure(server_address));
         exit.store(true, Ordering::Relaxed);
-        t.join().unwrap();
+        quic_server.join().unwrap();
     }
 }
