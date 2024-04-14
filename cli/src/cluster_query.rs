@@ -103,6 +103,19 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                 ),
         )
         .subcommand(
+            SubCommand::with_name("recent-prioritization-fees")
+                .about("Get recent prioritization fees")
+                .arg(
+                    Arg::with_name("account")
+                        .long("account")
+                        .value_name("ACCOUNT")
+                        .takes_value(true)
+                        .multiple(true)
+                        .index(1)
+                        .required(true),
+                ),
+        )
+        .subcommand(
             SubCommand::with_name("catchup")
                 .about("Wait for a validator to catch up to the cluster")
                 .arg(pubkey!(
@@ -571,6 +584,16 @@ pub fn parse_get_block(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliEr
     Ok(CliCommandInfo::without_signers(CliCommand::GetBlock {
         slot,
     }))
+}
+
+pub fn parse_get_recent_prioritization_fees(
+    matches: &ArgMatches<'_>,
+) -> Result<CliCommandInfo, CliError> {
+    let accounts = values_of(matches, "account").expect("accounts arg(s) should be present");
+    Ok(CliCommandInfo {
+        command: CliCommand::GetRecentPrioritizationFees { accounts },
+        signers: vec![],
+    })
 }
 
 pub fn parse_get_block_time(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
@@ -1042,6 +1065,20 @@ pub fn process_leader_schedule(
         epoch,
         leader_schedule_entries,
     }))
+}
+
+pub fn process_get_recent_priority_fees(
+    rpc_client: &RpcClient,
+    _config: &CliConfig,
+    accounts: &[Pubkey],
+) -> ProcessResult {
+    let mut ret = String::new();
+    if let Ok(fees) = rpc_client.get_recent_prioritization_fees(accounts) {
+        for (fee, account) in fees.iter().zip(accounts.iter()) {
+            ret.push_str(&format!("{:<44} => {:?}\n", account.to_string(), fee));
+        }
+    }
+    Ok(ret)
 }
 
 pub fn process_get_block(

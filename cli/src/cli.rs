@@ -69,6 +69,9 @@ pub enum CliCommand {
     GetBlock {
         slot: Option<Slot>,
     },
+    GetRecentPrioritizationFees {
+        accounts: Vec<Pubkey>,
+    },
     GetBlockTime {
         slot: Option<Slot>,
     },
@@ -609,6 +612,9 @@ pub fn parse_command(
         }
         // Cluster Query Commands
         ("block", Some(matches)) => parse_get_block(matches),
+        ("recent-prioritization-fees", Some(matches)) => {
+            parse_get_recent_prioritization_fees(matches)
+        }
         ("block-height", Some(matches)) => parse_get_block_height(matches),
         ("block-production", Some(matches)) => parse_show_block_production(matches),
         ("block-time", Some(matches)) => parse_get_block_time(matches),
@@ -905,6 +911,9 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
         CliCommand::FirstAvailableBlock => process_first_available_block(&rpc_client),
         CliCommand::GetBlock { slot } => process_get_block(&rpc_client, config, *slot),
         CliCommand::GetBlockTime { slot } => process_get_block_time(&rpc_client, config, *slot),
+        CliCommand::GetRecentPrioritizationFees { accounts } => {
+            process_get_recent_priority_fees(&rpc_client, config, accounts)
+        }
         CliCommand::GetEpoch => process_get_epoch(&rpc_client, config),
         CliCommand::GetEpochInfo => process_get_epoch_info(&rpc_client, config),
         CliCommand::GetGenesisHash => process_get_genesis_hash(&rpc_client),
