@@ -136,18 +136,24 @@ impl ServerTile {
         self.q_established.clear();
         self.pending_conns.clear();
 
-        // TODO timeout management
+        // todo: only check timeout if needed?
+        for (cid, conn) in self.conns.iter_mut() {
+            if let Some(ref mut conn) = conn.conn {
+                if let Some(t) = conn.timeout() {
+                    if t == Duration::new(0, 0) {
+                        conn.on_timeout();
+                    }
+                }
+            }
+        }
 
         info!("receiving.. connections: {}", self.conns.len());
         let packet_count = {
             let mut pb = &mut self.packet_batch.borrow_mut();
-            /*for p in pb.packets {
-                p.meta.reset();
-            }*/
             pb.truncate(0);
             crate::packet::recv_from(&mut pb, &self.socket, Duration::from_millis(10)).unwrap_or(0)
         };
-        info!("packets {}", packet_count);
+        info!("recv {} packets", packet_count);
 
         self.metrics
             .rx_pkt_cnt
