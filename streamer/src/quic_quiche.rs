@@ -5,6 +5,7 @@ use {
         quic::{QuicServer, QuicServerError},
         reasm::Reasm,
         streamer::StakedNodes,
+        tls_certificates::get_pubkey_from_der_bytes,
     },
     boring::{
         pkey::PKey,
@@ -23,7 +24,7 @@ use {
     std::{
         cell::RefCell,
         collections::{BinaryHeap, HashMap},
-        net::{SocketAddr, UdpSocket},
+        net::{IpAddr, SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, RwLock,
@@ -32,8 +33,17 @@ use {
     },
 };
 
-pub struct ServerTile {
+// Read-only shared state
+pub struct SharedTileState {
+    max_staked_connections: usize,
+    max_unstaked_connections: usize,
+    max_connections_per_peer: usize,
     local_addr: SocketAddr,
+}
+
+pub struct ServerTile {
+    shared_state: Arc<SharedTileState>,
+
     socket: UdpSocket,
     metrics: Arc<ServerMetrics>,
     packet_batch: RefCell<PacketBatch>,
@@ -42,7 +52,8 @@ pub struct ServerTile {
     q_established: Vec<(u16, ICID)>,
     conns: HashMap<ICID, Conn>, // Should probably be a LinkedList
     conn_ids: HashMap<SCID, ICID>,
-    max_connections: usize,
+    established_conns: HashMap<IpAddr, u8>,
+    icids_to_remove: Vec<u64>,
     rng: SmallRng,
     quiche_cfg: quiche::Config,
     next_icid: u64,
@@ -58,20 +69,22 @@ pub struct ServerTile {
     reasm: Reasm,
     exit: Arc<AtomicBool>,
     packet_sender: Sender<PacketBatch>,
+
+    staked_nodes: Arc<RwLock<StakedNodes>>,
 }
 
 impl ServerTile {
     pub fn new(
         socket: UdpSocket,
-        local_addr: SocketAddr,
         keypair: &Keypair,
-        max_connections: usize,
         exit: Arc<AtomicBool>,
         packet_sender: Sender<PacketBatch>,
+        shared_state: Arc<SharedTileState>,
+        staked_nodes: Arc<RwLock<StakedNodes>>,
     ) -> Self {
-        info!("new tile! {:?}", local_addr);
-        let conns = HashMap::with_capacity(max_connections);
-        let conn_ids = HashMap::with_capacity(max_connections * 4);
+        info!("new tile! {:?}", shared_state.local_addr);
+        let conns = HashMap::with_capacity(shared_state.max_staked_connections);
+        let conn_ids = HashMap::with_capacity(shared_state.max_staked_connections * 4);
 
         // TODO should probably only sign this once
         let (cert_bytes, cert_key_bytes) = crate::cert::new_dummy_x509_certificate(keypair);
@@ -98,16 +111,16 @@ impl ServerTile {
         let packet_batch = RefCell::new(PacketBatch::with_capacity(128));
 
         Self {
-            local_addr,
+            shared_state,
             socket,
             packet_batch,
             metrics: Arc::new(ServerMetrics::default()),
             q_initial: Vec::with_capacity(EVENT_CNT),
             q_handshake: Vec::with_capacity(EVENT_CNT),
             q_established: Vec::with_capacity(EVENT_CNT),
+            established_conns: HashMap::new(),
             conns,
             conn_ids,
-            max_connections,
             rng: SmallRng::from_entropy(),
             quiche_cfg,
             next_icid: 0u64,
@@ -116,6 +129,8 @@ impl ServerTile {
             reasm: Reasm::new(REASM_DEPTH),
             exit,
             packet_sender,
+            icids_to_remove: Vec::new(),
+            staked_nodes: staked_nodes.clone(),
         }
     }
 
@@ -137,7 +152,7 @@ impl ServerTile {
         self.pending_conns.clear();
 
         // todo: only check timeout if needed?
-        for (cid, conn) in self.conns.iter_mut() {
+        for (_cid, conn) in self.conns.iter_mut() {
             if let Some(ref mut conn) = conn.conn {
                 if let Some(t) = conn.timeout() {
                     if t == Duration::new(0, 0) {
@@ -205,7 +220,7 @@ impl ServerTile {
             match (hdr.ty, icid) {
                 (quiche::Type::Initial, None) => {
                     // Statelessly process connection requests
-                    info!("initial packet: {}", pkt_idx);
+                    warn!("initial packet: {}", pkt_idx);
                     self.q_initial.push(pkt_idx as u16);
                     continue 'triage;
                 }
@@ -268,7 +283,7 @@ impl ServerTile {
                 &mut packet.buffer_mut()[..packet_size],
                 quiche::RecvInfo {
                     from,
-                    to: self.local_addr,
+                    to: self.shared_state.local_addr,
                 },
             ) {
                 Ok(v) => {
@@ -334,7 +349,6 @@ impl ServerTile {
                         info!("finish.. {:?}", reasm_id);
                         let data = self.reasm.finish(reasm_id);
                         self.metrics.tpu_txn_cnt.fetch_add(1, Ordering::Relaxed);
-                        // TODO handle data
                         if let Err(e) = self.packet_sender.send(data) {
                             info!("Packet send error? {:?}", e);
                         }
@@ -362,6 +376,16 @@ impl ServerTile {
                 continue 'initial;
             }
 
+            if let Some(count) = self
+                .established_conns
+                .get(&packet.meta().socket_addr().ip())
+            {
+                warn!("count: {}", count);
+                if *count as usize > self.shared_state.max_connections_per_peer {
+                    continue 'initial;
+                }
+            }
+
             if !quiche::version_is_supported(hdr.version) {
                 info!("version not supported? {}", hdr.version);
                 self.metrics
@@ -376,11 +400,15 @@ impl ServerTile {
             let new_dcid_u: u64 = self.rng.gen();
             let new_dcid_b = new_dcid_u.to_le_bytes();
             let new_dcid = ConnectionId::from_ref(&new_dcid_b[..]);
-            info!("accepting..?");
+            warn!(
+                "accepting..? dcid?: {} {}",
+                new_dcid_u,
+                packet.meta().socket_addr()
+            );
             let quiche_conn = quiche::accept(
                 &new_dcid,
                 None,
-                self.local_addr,
+                self.shared_state.local_addr,
                 packet.meta().socket_addr(),
                 &mut self.quiche_cfg,
             )
@@ -396,7 +424,7 @@ impl ServerTile {
                 &mut packet.buffer_mut()[..packet_size],
                 quiche::RecvInfo {
                     from,
-                    to: self.local_addr,
+                    to: self.shared_state.local_addr,
                 },
             ) {
                 Ok(v) => {
@@ -412,9 +440,53 @@ impl ServerTile {
                 }
             };
 
-            self.conn_ids.insert(new_dcid_u as SCID, new_icid as ICID);
+            let (stake, max_connections) = {
+                let pk = if let Some(certs) = quiche_conn.peer_cert_chain() {
+                    if certs.len() == 1 {
+                        get_pubkey_from_der_bytes(certs[0])
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(pk) = pk {
+                    let staked_nodes = self.staked_nodes.read().unwrap();
+                    if let Some(stake) = staked_nodes.get_node_stake(&pk) {
+                        (stake, staked_nodes.total_stake())
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                }
+            };
+
             Self::update_scids(new_icid, quiche_conn, &mut self.conn_ids, &mut self.rng);
+            self.icids_to_remove.clear();
+            if self.conns.len() > self.shared_state.max_staked_connections {
+                for (icid, conn) in &self.conns {
+                    if let Some(conn) = &conn.conn {
+                        if conn.is_closed() {
+                            self.icids_to_remove.push(*icid);
+                            break;
+                        }
+                    }
+                }
+            }
+            for icid in &self.icids_to_remove {
+                self.conns.remove(&icid);
+                // todo: prune conn_ids?
+                //self.conn_ids.retain(||);
+            }
+
+            self.conn_ids.insert(new_dcid_u as SCID, new_icid as ICID);
             self.conns.insert(new_icid, conn);
+
+            *self
+                .established_conns
+                .entry(packet.meta().socket_addr().ip())
+                .or_insert(0) += 1;
 
             self.pending_conns.push(new_icid);
             self.metrics.quic_accept_cnt.fetch_add(1, Ordering::Relaxed);
@@ -561,7 +633,9 @@ pub struct Server {
 pub struct ServerConfig {
     pub tile_count: usize,
     pub listen_addr: SocketAddr,
-    pub max_connections: usize,
+    pub max_staked_connections: usize,
+    pub max_unstaked_connections: usize,
+    pub max_connections_per_peer: usize,
 }
 
 impl QuicServer for Server {
@@ -580,17 +654,25 @@ impl Server {
         sockets: Vec<UdpSocket>,
         exit: Arc<AtomicBool>,
         packet_sender: Sender<PacketBatch>,
+        staked_nodes: Arc<RwLock<StakedNodes>>,
     ) -> Result<Self, std::io::Error> {
+        let shared_tile_state = SharedTileState {
+            local_addr: config.listen_addr,
+            max_connections_per_peer: config.max_connections_per_peer,
+            max_staked_connections: config.max_staked_connections,
+            max_unstaked_connections: config.max_unstaked_connections,
+        };
+        let shared_tile_state = Arc::new(shared_tile_state);
         let tiles = sockets
             .into_iter()
             .map(|s| {
                 ServerTile::new(
                     s,
-                    config.listen_addr,
                     keypair,
-                    config.max_connections,
                     exit.clone(),
                     packet_sender.clone(),
+                    shared_tile_state.clone(),
+                    staked_nodes.clone(),
                 )
             })
             .collect::<Vec<ServerTile>>();
@@ -613,7 +695,7 @@ impl Server {
                     tile.run();
                 })
             })
-            .for_each(|hdl| self.thread_handles.borrow_mut().push(hdl));
+            .for_each(|thread_handle| self.thread_handles.borrow_mut().push(thread_handle));
     }
 
     pub fn wait(&mut self) {
@@ -641,16 +723,25 @@ pub fn spawn_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     max_staked_connections: usize,
     max_unstaked_connections: usize,
-    wait_for_chunk_timeout: Duration,
-    coalesce: Duration,
+    _wait_for_chunk_timeout: Duration,
+    _coalesce: Duration,
 ) -> Result<Box<dyn QuicServer>, QuicServerError> {
     let config = ServerConfig {
         tile_count: 1,
         listen_addr: "0.0.0.0:0".parse().unwrap(),
-        max_connections: max_staked_connections,
+        max_staked_connections,
+        max_unstaked_connections,
+        max_connections_per_peer,
     };
-    let mut s = Server::new(&config, keypair, vec![sock], exit, packet_sender)
-        .map_err(|_e| QuicServerError::Failed)?;
+    let mut s = Server::new(
+        &config,
+        keypair,
+        vec![sock],
+        exit,
+        packet_sender,
+        staked_nodes,
+    )
+    .map_err(|_e| QuicServerError::Failed)?;
     s.start();
     Ok(Box::new(s))
 }

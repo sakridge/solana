@@ -96,12 +96,16 @@ pub fn new_dummy_x509_certificate(keypair: &Keypair) -> (rustls::Certificate, ru
     )
 }
 
-pub fn get_pubkey_from_tls_certificate(der_cert: &rustls::Certificate) -> Option<Pubkey> {
-    let (_, cert) = X509Certificate::from_der(der_cert.as_ref()).ok()?;
+pub fn get_pubkey_from_der_bytes(der_bytes: &[u8]) -> Option<Pubkey> {
+    let (_, cert) = X509Certificate::from_der(der_bytes).ok()?;
     match cert.public_key().parsed().ok()? {
         PublicKey::Unknown(key) => Pubkey::try_from(key).ok(),
         _ => None,
     }
+}
+
+pub fn get_pubkey_from_tls_certificate(der_cert: &rustls::Certificate) -> Option<Pubkey> {
+    get_pubkey_from_der_bytes(der_cert.as_ref())
 }
 
 #[cfg(test)]
